@@ -25,6 +25,7 @@ import {
   getDocs,
   writeBatch,
   getDocFromServer,
+  documentId,
   limit,
   increment,
   updatePassword,
@@ -50,6 +51,7 @@ import {
   Download,
   Share2,
   Calendar,
+  Camera,
   DollarSign,
   User as UserIcon,
   Lock,
@@ -84,11 +86,12 @@ import {
   Flag,
   Star,
   Archive,
-  BarChart3
+  BarChart3,
+  ScanQrCode
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'sonner';
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Share } from '@capacitor/share';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import * as htmlToImage from 'html-to-image';
@@ -148,6 +151,7 @@ interface LotteryTicket {
   totalAmount: number;
   chancePrice?: number;
   timestamp: any;
+  date?: string;
   sellerId: string;
   sellerCode?: string;
   sellerEmail?: string;
@@ -276,6 +280,290 @@ interface RecoveryTicketRecord {
   bets: Bet[];
   raw: Record<string, any>;
 }
+
+type PrinterPaperWidth = '58' | '80';
+
+interface BluetoothPrinterProfile {
+  id: string;
+  label: string;
+  serviceUuid: string;
+  characteristicUuid: string;
+}
+
+interface BluetoothPrinterConfig {
+  deviceId: string;
+  deviceName: string;
+  deviceAddress?: string;
+  profileId: string;
+  serviceUuid: string;
+  characteristicUuid: string;
+  paperWidth: PrinterPaperWidth;
+  connectedAt: string;
+}
+
+interface NativeBluetoothPrinterDevice {
+  name: string;
+  address: string;
+}
+
+interface NativeBluetoothPrinterPlugin {
+  listBondedDevices(): Promise<{ devices: NativeBluetoothPrinterDevice[] }>;
+  print(options: { address: string; text: string; qr?: string }): Promise<void>;
+  openBluetoothSettings(): Promise<void>;
+  requestPermissions(): Promise<Record<string, string>>;
+}
+
+const NativeBluetoothPrinter = registerPlugin<NativeBluetoothPrinterPlugin>('BluetoothPrinter');
+
+const BLUETOOTH_PRINTER_STORAGE_KEY = 'chancepro.bluetoothPrinter.v1';
+const USER_STATUS_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const USER_STATUS_LAST_CHECK_STORAGE_PREFIX = 'chancepro.userStatusLastCheck.';
+
+const BLUETOOTH_PRINTER_PROFILES: BluetoothPrinterProfile[] = [
+  {
+    id: 'escpos-18f0',
+    label: 'Generica ESC/POS BLE',
+    serviceUuid: '000018f0-0000-1000-8000-00805f9b34fb',
+    characteristicUuid: '00002af1-0000-1000-8000-00805f9b34fb'
+  },
+  {
+    id: 'serial-ffe0',
+    label: 'Serial BLE FFE0/FFE1',
+    serviceUuid: '0000ffe0-0000-1000-8000-00805f9b34fb',
+    characteristicUuid: '0000ffe1-0000-1000-8000-00805f9b34fb'
+  },
+  {
+    id: 'nordic-uart',
+    label: 'Nordic UART',
+    serviceUuid: '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+    characteristicUuid: '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
+  }
+];
+
+const getBluetoothApi = () => (navigator as any).bluetooth || null;
+
+const getSavedBluetoothPrinterConfig = (): BluetoothPrinterConfig | null => {
+  try {
+    const raw = localStorage.getItem(BLUETOOTH_PRINTER_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as BluetoothPrinterConfig;
+  } catch {
+    return null;
+  }
+};
+
+const saveBluetoothPrinterConfig = (config: BluetoothPrinterConfig | null) => {
+  if (!config) {
+    localStorage.removeItem(BLUETOOTH_PRINTER_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(BLUETOOTH_PRINTER_STORAGE_KEY, JSON.stringify(config));
+};
+
+const isNativeAndroid = () => Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+
+const getPrinterProfilesToTry = (profileId?: string) => {
+  const selected = BLUETOOTH_PRINTER_PROFILES.find(profile => profile.id === profileId);
+  return selected
+    ? [selected, ...BLUETOOTH_PRINTER_PROFILES.filter(profile => profile.id !== selected.id)]
+    : BLUETOOTH_PRINTER_PROFILES;
+};
+
+const ensureBluetoothPrinterSupport = () => {
+  const bluetooth = getBluetoothApi();
+  if (!bluetooth) {
+    throw new Error('Este dispositivo o navegador no permite Bluetooth desde la app.');
+  }
+  if (!window.isSecureContext) {
+    throw new Error('Bluetooth requiere abrir la app por HTTPS o localhost.');
+  }
+  return bluetooth;
+};
+
+const getPrinterCharacteristic = async (server: any, profiles: BluetoothPrinterProfile[]) => {
+  let lastError: unknown = null;
+  for (const profile of profiles) {
+    try {
+      const service = await server.getPrimaryService(profile.serviceUuid);
+      const characteristic = await service.getCharacteristic(profile.characteristicUuid);
+      return { characteristic, profile };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(lastError instanceof Error ? lastError.message : 'La impresora no expone un servicio compatible.');
+};
+
+const connectBluetoothPrinter = async (profileId: string, paperWidth: PrinterPaperWidth): Promise<BluetoothPrinterConfig> => {
+  const bluetooth = ensureBluetoothPrinterSupport();
+  const optionalServices = Array.from(new Set(BLUETOOTH_PRINTER_PROFILES.map(profile => profile.serviceUuid)));
+  const device = await bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices
+  });
+
+  if (!device?.gatt) {
+    throw new Error('No se pudo abrir la conexion GATT de la impresora.');
+  }
+
+  const server = await device.gatt.connect();
+  const { profile } = await getPrinterCharacteristic(server, getPrinterProfilesToTry(profileId));
+  device.gatt.disconnect?.();
+
+  const config: BluetoothPrinterConfig = {
+    deviceId: device.id,
+    deviceName: device.name || 'Impresora Bluetooth',
+    profileId: profile.id,
+    serviceUuid: profile.serviceUuid,
+    characteristicUuid: profile.characteristicUuid,
+    paperWidth,
+    connectedAt: new Date().toISOString()
+  };
+  saveBluetoothPrinterConfig(config);
+  return config;
+};
+
+const sanitizeReceiptText = (value: unknown) => {
+  return String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x20-\x7E\n]/g, '')
+    .trim();
+};
+
+const centerReceiptLine = (text: string, width: number) => {
+  const clean = sanitizeReceiptText(text).slice(0, width);
+  const padding = Math.max(0, Math.floor((width - clean.length) / 2));
+  return `${' '.repeat(padding)}${clean}`;
+};
+
+const receiptPairLine = (left: string, right: string, width: number) => {
+  const cleanLeft = sanitizeReceiptText(left);
+  const cleanRight = sanitizeReceiptText(right);
+  const space = Math.max(1, width - cleanLeft.length - cleanRight.length);
+  return `${cleanLeft.slice(0, Math.max(1, width - cleanRight.length - 1))}${' '.repeat(space)}${cleanRight}`;
+};
+
+const ESC_POS_BOLD_ON = '\x1bE\x01';
+const ESC_POS_BOLD_OFF = '\x1bE\x00';
+const ESC_POS_ALIGN_LEFT = '\x1ba\x00';
+const ESC_POS_ALIGN_CENTER = '\x1ba\x01';
+const ESC_POS_LINE_SPACING_DEFAULT = '\x1b2';
+const ESC_POS_LINE_SPACING_BETS = '\x1b3\x2a';
+
+const boldReceiptText = (text: string) => `${ESC_POS_BOLD_ON}${text}${ESC_POS_BOLD_OFF}`;
+
+const buildEscPosQrBytes = (value: string) => {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(sanitizeReceiptText(value));
+  const storeLen = data.length + 3;
+  const pL = storeLen & 0xff;
+  const pH = (storeLen >> 8) & 0xff;
+  const commands = [
+    new Uint8Array([0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]),
+    new Uint8Array([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x06]),
+    new Uint8Array([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31]),
+    new Uint8Array([0x1b, 0x61, 0x01]),
+    new Uint8Array([0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30]),
+    data,
+    new Uint8Array([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30]),
+    new Uint8Array([0x1b, 0x61, 0x00])
+  ];
+  const totalLength = commands.reduce((sum, chunk) => sum + chunk.length, 0);
+  const output = new Uint8Array(totalLength);
+  let offset = 0;
+  commands.forEach(chunk => {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  });
+  return output;
+};
+
+const buildEscPosBytes = (text: string, qrValue?: string) => {
+  const encoder = new TextEncoder();
+  const normalizedText = text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x00-\x7E\n]/g, '')
+    .trim();
+  const content = encoder.encode(normalizedText.replace(/\n/g, '\r\n'));
+  const init = new Uint8Array([0x1b, 0x40, 0x1b, 0x74, 0x00]);
+  const qr = qrValue ? buildEscPosQrBytes(qrValue) : new Uint8Array();
+  const feedAndCut = new Uint8Array([0x0a, 0x0a, 0x0a, 0x1d, 0x56, 0x42, 0x00]);
+  const output = new Uint8Array(init.length + content.length + qr.length + feedAndCut.length);
+  output.set(init, 0);
+  output.set(content, init.length);
+  output.set(qr, init.length + content.length);
+  output.set(feedAndCut, init.length + content.length + qr.length);
+  return output;
+};
+
+const writePrinterBytes = async (characteristic: any, bytes: Uint8Array) => {
+  const chunkSize = 20;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.slice(offset, offset + chunkSize);
+    if (typeof characteristic.writeValueWithoutResponse === 'function') {
+      await characteristic.writeValueWithoutResponse(chunk);
+    } else {
+      await characteristic.writeValue(chunk);
+    }
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+};
+
+const printEscPosText = async (text: string, qrValue?: string) => {
+  const config = getSavedBluetoothPrinterConfig();
+  if (!config) {
+    throw new Error('Configura primero la impresora Bluetooth en Configuracion.');
+  }
+
+  if (isNativeAndroid()) {
+    if (!config.deviceAddress) {
+      throw new Error('Selecciona una impresora vinculada desde Configuracion.');
+    }
+    await NativeBluetoothPrinter.print({
+      address: config.deviceAddress,
+      text,
+      qr: qrValue
+    });
+    return;
+  }
+
+  const bluetooth = ensureBluetoothPrinterSupport();
+  let device: any | undefined;
+
+  if (typeof bluetooth.getDevices === 'function') {
+    const devices = await bluetooth.getDevices();
+    device = devices.find((item: any) => item.id === config.deviceId);
+  }
+
+  if (!device) {
+    device = await bluetooth.requestDevice({
+      filters: [{ name: config.deviceName }],
+      optionalServices: Array.from(new Set(BLUETOOTH_PRINTER_PROFILES.map(profile => profile.serviceUuid)))
+    });
+  }
+
+  if (!device?.gatt) {
+    throw new Error('No se pudo abrir la conexion Bluetooth de la impresora.');
+  }
+
+  const server = await device.gatt.connect();
+  try {
+    const { characteristic, profile } = await getPrinterCharacteristic(server, getPrinterProfilesToTry(config.profileId));
+    await writePrinterBytes(characteristic, buildEscPosBytes(text, qrValue));
+    if (profile.id !== config.profileId) {
+      saveBluetoothPrinterConfig({
+        ...config,
+        profileId: profile.id,
+        serviceUuid: profile.serviceUuid,
+        characteristicUuid: profile.characteristicUuid
+      });
+    }
+  } finally {
+    device.gatt.disconnect?.();
+  }
+};
 
 // --- Error Boundary ---
 enum OperationType {
@@ -908,6 +1196,102 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
     toast.success('PDF generado correctamente');
   };
 
+  const buildThermalTicketText = () => {
+    const config = getSavedBluetoothPrinterConfig();
+    const width = config?.paperWidth === '80' ? 40 : 30;
+    const line = '-'.repeat(width);
+    const ticketDate = getTicketDate(ticket);
+    const dateLabel = ticket.timestamp?.toDate
+      ? format(ticket.timestamp.toDate(), 'dd/MM/yyyy hh:mm a')
+      : format(new Date(), 'dd/MM/yyyy hh:mm a');
+    const lines: string[] = [
+      ESC_POS_ALIGN_CENTER,
+      boldReceiptText(centerReceiptLine('CHANCE PRO', width)),
+      centerReceiptLine('COMPROBANTE DE VENTA', width),
+      ESC_POS_ALIGN_LEFT,
+      line,
+      boldReceiptText(`Fecha: ${dateLabel}`),
+      boldReceiptText(`Vendedor: ${ticket.sellerCode || '---'}`),
+      boldReceiptText(`Cliente: ${ticket.customerName || 'Cliente General'}`),
+      boldReceiptText(`Seq: ${ticket.sequenceNumber || '---'}`),
+      `Ticket: ${ticket.id.slice(0, Math.max(8, width - 8))}`,
+      line,
+      ESC_POS_LINE_SPACING_BETS
+    ];
+
+    const lotteryEntries = Array.from(
+      (ticket.bets || []).reduce((map, bet) => {
+        const rawLottery = (bet?.lottery || '').trim();
+        const lotteryKey = normalizePlainText(rawLottery);
+        if (!lotteryKey) return map;
+        if (!map.has(lotteryKey)) map.set(lotteryKey, rawLottery);
+        return map;
+      }, new Map<string, string>()).entries()
+    ).filter(([lotteryKey]) => showFullTicket || !selectedLotteryName || lotteryKey === normalizePlainText(selectedLotteryName));
+
+    lotteryEntries.forEach(([lotteryKey, lotName]) => {
+      const betsForLot = (ticket.bets || []).filter(b => normalizePlainText(b?.lottery || '') === lotteryKey);
+      const unifiedBetsForLot = unifyBets(betsForLot.map(b => ({ ...b, lottery: lotName })));
+      const result = results.find(r => normalizePlainText(r.lotteryName) === lotteryKey && r.date === ticketDate);
+
+      lines.push(boldReceiptText(cleanText(lotName).toUpperCase()));
+      if (result) {
+        lines.push(`1:${result.firstPrize} 2:${result.secondPrize} 3:${result.thirdPrize}`);
+      }
+
+      unifiedBetsForLot.forEach((bet) => {
+        const originalMatches = (ticket.bets || [])
+          .map((original, originalIdx) => ({ original, originalIdx }))
+          .filter(({ original }) =>
+            normalizePlainText(original?.lottery || '') === lotteryKey &&
+            original.number === bet.number &&
+            original.type === bet.type
+          );
+        const betWinnings = winningBets.filter(wb => originalMatches.some(match => match.originalIdx === wb.idx));
+        const betTotalPrize = betWinnings.reduce((sum, wb) => sum + wb.prize, 0);
+        const numStr = bet?.type === 'PL' && bet?.number?.length === 4
+          ? `${bet.number.slice(0, 2)}-${bet.number.slice(2, 4)}`
+          : (bet?.number || '??');
+        const desc = `${numStr} ${bet?.type || '?'} x${bet.quantity}`;
+
+        lines.push(receiptPairLine(desc, `$${(bet?.amount || 0).toFixed(2)}`, width));
+        if (betTotalPrize > 0) {
+          lines.push(boldReceiptText(`  PREMIA: $${betTotalPrize.toFixed(2)}`));
+        }
+      });
+      lines.push(line);
+    });
+
+    lines.push(ESC_POS_LINE_SPACING_DEFAULT);
+    if (totalPrize > 0) {
+      lines.push(boldReceiptText(receiptPairLine('PREMIO TOTAL', `USD ${totalPrize.toFixed(2)}`, width)));
+    }
+    lines.push(boldReceiptText(receiptPairLine('TOTAL A PAGAR', `USD ${localTotalAmount.toFixed(2)}`, width)));
+    lines.push(line);
+    lines.push(ESC_POS_ALIGN_CENTER);
+    lines.push(centerReceiptLine('Gracias por su compra', width));
+    lines.push(centerReceiptLine('Verifique su ticket', width));
+    lines.push(centerReceiptLine('antes de salir', width));
+    lines.push(centerReceiptLine('Presente este ticket', width));
+    lines.push(centerReceiptLine('para reclamar su premio', width));
+    lines.push(ESC_POS_ALIGN_LEFT);
+    lines.push('');
+
+    return lines.join('\n');
+  };
+
+  const printBluetoothTicket = async () => {
+    if (!ticket) return;
+    const toastId = toast.loading('Enviando ticket a impresora...');
+    try {
+      await printEscPosText(buildThermalTicketText(), `ticket:${ticket.id}:${getTicketDate(ticket)}`);
+      toast.success('Ticket enviado a la impresora', { id: toastId });
+    } catch (error: any) {
+      console.error('Error printing ticket:', error);
+      toast.error(error?.message || 'No se pudo imprimir el ticket', { id: toastId });
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
       <motion.div 
@@ -1120,7 +1504,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
           {/* QR and Verification */}
           <div className="flex flex-col items-center gap-4 bg-gray-50/50 p-4 rounded-xl border border-gray-100">
             <div className="p-2 bg-white rounded-lg shadow-sm">
-              <QRCode value={`ticket:${ticket.id}`} size={80} />
+              <QRCode value={`ticket:${ticket.id}:${getTicketDate(ticket)}`} size={80} />
             </div>
             <div className="text-center">
               <p className="text-xs font-bold uppercase tracking-widest text-gray-800">¡Buena Suerte!</p>
@@ -1131,10 +1515,10 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
 
         <div className="grid grid-cols-2 gap-2 mt-4 p-4 border-t border-gray-100">
           <button 
-            onClick={() => printTicket()}
+            onClick={() => printBluetoothTicket()}
             className="flex items-center justify-center gap-2 bg-black text-white py-3 rounded-lg font-bold text-xs uppercase hover:bg-gray-800 transition-colors"
           >
-            <Printer className="w-4 h-4" /> PDF
+            <Printer className="w-4 h-4" /> Imprimir
           </button>
           <button 
             onClick={() => downloadTicket()}
@@ -1160,10 +1544,143 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
   );
 };
 
+const TicketQrScannerModal = ({ show, onClose, onScan }: { show: boolean; onClose: () => void; onScan: (value: string) => void }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [manualCode, setManualCode] = useState('');
+  const [scannerError, setScannerError] = useState('');
+
+  useEffect(() => {
+    if (!show) return;
+
+    let stopped = false;
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    const stopCamera = () => {
+      if (intervalId) clearInterval(intervalId);
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    };
+
+    const startScanner = async () => {
+      setScannerError('');
+      try {
+        const BarcodeDetectorCtor = (window as any).BarcodeDetector;
+        if (!BarcodeDetectorCtor) {
+          setScannerError('Este dispositivo no permite lectura QR automática. Ingresa el código manualmente.');
+          return;
+        }
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' } },
+          audio: false
+        });
+        if (stopped) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+
+        const detector = new BarcodeDetectorCtor({ formats: ['qr_code'] });
+        intervalId = setInterval(async () => {
+          if (!videoRef.current || stopped) return;
+          try {
+            const codes = await detector.detect(videoRef.current);
+            const rawValue = codes?.[0]?.rawValue;
+            if (rawValue) {
+              stopped = true;
+              stopCamera();
+              onScan(rawValue);
+            }
+          } catch {
+            // Keep scanning; some frames fail while the camera adjusts focus.
+          }
+        }, 700);
+      } catch (error: any) {
+        setScannerError(error?.message || 'No se pudo abrir la cámara.');
+      }
+    };
+
+    startScanner();
+
+    return () => {
+      stopped = true;
+      stopCamera();
+    };
+  }, [onScan, show]);
+
+  if (!show) return null;
+
+  const submitManualCode = () => {
+    const value = manualCode.trim();
+    if (!value) return;
+    onScan(value);
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+      <motion.div
+        initial={{ scale: 0.96, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        className="glass-card w-full max-w-md p-4 sm:p-6 space-y-4"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-primary/20 text-primary">
+              <ScanQrCode className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-black uppercase tracking-widest text-sm">Verificar Ticket</h3>
+              <p className="text-[10px] font-mono text-muted-foreground uppercase">Escanea el QR impreso</p>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-muted-foreground">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="relative overflow-hidden rounded-xl border border-white/10 bg-black aspect-square">
+          <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
+          <div className="absolute inset-8 border-2 border-primary/70 rounded-xl pointer-events-none" />
+          <div className="absolute left-8 right-8 top-1/2 h-0.5 bg-primary/80 shadow-[0_0_18px_rgba(34,211,238,0.8)] pointer-events-none" />
+        </div>
+
+        {scannerError && (
+          <p className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 leading-relaxed">
+            {scannerError}
+          </p>
+        )}
+
+        <div className="grid grid-cols-[1fr_auto] gap-2">
+          <input
+            value={manualCode}
+            onChange={(e) => setManualCode(e.target.value)}
+            placeholder="Primeros 6 del ticket"
+            className="min-w-0 bg-white/5 border border-white/10 rounded-xl px-3 py-3 text-xs focus:outline-none focus:border-primary"
+          />
+          <button
+            type="button"
+            onClick={submitManualCode}
+            className="px-4 py-3 bg-primary text-primary-foreground rounded-xl font-black uppercase text-[10px] tracking-widest"
+          >
+            Buscar
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+};
+
 const Login = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [inactiveUserMessage, setInactiveUserMessage] = useState('');
 
   const handleResetPassword = async () => {
     if (!username) {
@@ -1221,21 +1738,21 @@ const Login = () => {
       const userCredential = await signInWithEmailAndPassword(auth, email, password);
       const signedInEmail = (userCredential.user.email || email).toLowerCase();
 
-      // Validate active/inactive only on explicit credential login.
-      if (signedInEmail !== ceoEmail.toLowerCase()) {
-        const userDoc = await getDoc(doc(db, 'users', signedInEmail));
-        if (!userDoc.exists()) {
-          await signOut(auth);
-          localStorage.removeItem('sessionBusinessDay');
-          toast.error('Tu usuario no existe en la base de datos.');
-          return;
-        }
+      const userDoc = await getDoc(doc(db, 'users', signedInEmail));
+      if (!userDoc.exists() && signedInEmail !== ceoEmail.toLowerCase()) {
+        await signOut(auth);
+        localStorage.removeItem('sessionBusinessDay');
+        toast.error('Tu usuario no existe en la base de datos.');
+        return;
+      }
 
+      if (userDoc.exists()) {
         const profile = userDoc.data() as UserProfile;
         if ((profile.status || 'active') !== 'active') {
           await signOut(auth);
           localStorage.removeItem('sessionBusinessDay');
-          toast.error('Tu usuario está inactivo. Contacta al administrador.');
+          toast.dismiss(toastId);
+          setInactiveUserMessage('Usuario inactivo. Contactar al administrador.');
           return;
         }
       }
@@ -1273,6 +1790,36 @@ const Login = () => {
       {/* Background Accents */}
       <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-primary/20 rounded-full blur-[120px]" />
       <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-primary/10 rounded-full blur-[120px]" />
+
+      {inactiveUserMessage && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="relative w-full max-w-sm rounded-2xl border border-red-500/30 bg-[#111827] p-6 shadow-2xl"
+          >
+            <button
+              type="button"
+              onClick={() => setInactiveUserMessage('')}
+              className="absolute right-3 top-3 rounded-lg p-2 text-muted-foreground hover:bg-white/10 hover:text-white transition-colors"
+              aria-label="Cerrar aviso"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <div className="pr-8 space-y-3">
+              <div className="w-12 h-12 rounded-xl bg-red-500/15 text-red-400 flex items-center justify-center border border-red-500/20">
+                <UserIcon className="w-6 h-6" />
+              </div>
+              <div>
+                <h2 className="text-lg font-black uppercase tracking-widest text-white">Usuario inactivo</h2>
+                <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
+                  Tu usuario se encuentra desactivado. Contactar al administrador.
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
 
       <motion.div 
         key="login-form-container"
@@ -3051,6 +3598,9 @@ function App() {
 
   const [tickets, setTickets] = useState<LotteryTicket[]>([]);
   const [historyTickets, setHistoryTickets] = useState<LotteryTicket[]>([]);
+  const [enableShowAllToday, setEnableShowAllToday] = useState<boolean>(() => {
+    try { return JSON.parse(localStorage.getItem('enableShowAllToday') || 'false'); } catch { return false; }
+  });
   const [lotteries, setLotteries] = useState<Lottery[]>([]);
   const [results, setResults] = useState<LotteryResult[]>([]);
   const [activeTab, setActiveTab] = useState<'sales' | 'history' | 'admin' | 'dashboard' | 'results' | 'users' | 'liquidaciones' | 'config' | 'archivo' | 'stats' | 'cierres' | 'recovery'>('history');
@@ -3084,6 +3634,13 @@ function App() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
   const [isUpdatingChancePrice, setIsUpdatingChancePrice] = useState(false);
+  const [bluetoothPrinterConfig, setBluetoothPrinterConfig] = useState<BluetoothPrinterConfig | null>(() => getSavedBluetoothPrinterConfig());
+  const [selectedBluetoothPrinterProfileId, setSelectedBluetoothPrinterProfileId] = useState(() => getSavedBluetoothPrinterConfig()?.profileId || BLUETOOTH_PRINTER_PROFILES[0].id);
+  const [selectedPrinterPaperWidth, setSelectedPrinterPaperWidth] = useState<PrinterPaperWidth>(() => getSavedBluetoothPrinterConfig()?.paperWidth || '58');
+  const [isConnectingPrinter, setIsConnectingPrinter] = useState(false);
+  const [nativeBluetoothPrinters, setNativeBluetoothPrinters] = useState<NativeBluetoothPrinterDevice[]>([]);
+  const [selectedNativePrinterAddress, setSelectedNativePrinterAddress] = useState(() => getSavedBluetoothPrinterConfig()?.deviceAddress || '');
+  const [isLoadingNativePrinters, setIsLoadingNativePrinters] = useState(false);
 
   useEffect(() => {
     if (!userProfile) return;
@@ -3102,6 +3659,7 @@ function App() {
 
   const [historyFilter, setHistoryFilter] = useState<'TODO' | 'CHANCE' | 'BILLETE' | 'PALE'>('TODO');
   const [showTicketModal, setShowTicketModal] = useState<{ ticket: LotteryTicket, selectedLotteryName?: string } | null>(null);
+  const [showTicketScanner, setShowTicketScanner] = useState(false);
   const [showLotteryModal, setShowLotteryModal] = useState<boolean>(false);
   const [editingResult, setEditingResult] = useState<LotteryResult | null>(null);
   const [resultFormDate, setResultFormDate] = useState(format(getBusinessDate(), 'yyyy-MM-dd'));
@@ -3582,6 +4140,73 @@ function App() {
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (!user?.email) return;
+
+    const email = user.email.toLowerCase();
+    const lastCheckStorageKey = `${USER_STATUS_LAST_CHECK_STORAGE_PREFIX}${email}`;
+    let stopped = false;
+    let intervalId: ReturnType<typeof setInterval>;
+
+    const signOutInactiveUser = async (message = 'Usuario inactivo. Contactar al administrador.') => {
+      if (stopped) return;
+      setUserProfile(null);
+      setUser(null);
+      clearSessionDay();
+      await signOut(auth);
+      toast.error(message);
+    };
+
+    const checkCurrentUserStatus = async (force = false) => {
+      const currentUser = auth.currentUser;
+      const currentEmail = currentUser?.email?.toLowerCase();
+      if (!currentEmail || currentEmail !== email) return;
+
+      const now = Date.now();
+      const lastCheck = Number(localStorage.getItem(lastCheckStorageKey) || 0);
+      if (!force && lastCheck && now - lastCheck < USER_STATUS_CHECK_INTERVAL_MS) return;
+
+      try {
+        const userDoc = await getDocFromServer(doc(db, 'users', email));
+        localStorage.setItem(lastCheckStorageKey, String(now));
+
+        if (!userDoc.exists()) {
+          await signOutInactiveUser('Tu usuario no existe en la base de datos.');
+          return;
+        }
+
+        const profile = userDoc.data() as UserProfile;
+        if ((profile.status || 'active') !== 'active') {
+          await signOutInactiveUser();
+          return;
+        }
+
+        setUserProfile(profile);
+      } catch (error) {
+        console.error('Error checking current user status:', error);
+      }
+    };
+
+    const checkWhenDue = () => {
+      if (document.visibilityState === 'hidden') return;
+      void checkCurrentUserStatus(false);
+    };
+
+    void checkCurrentUserStatus(false);
+    intervalId = setInterval(() => {
+      void checkCurrentUserStatus(true);
+    }, USER_STATUS_CHECK_INTERVAL_MS);
+    window.addEventListener('focus', checkWhenDue);
+    document.addEventListener('visibilitychange', checkWhenDue);
+
+    return () => {
+      stopped = true;
+      clearInterval(intervalId);
+      window.removeEventListener('focus', checkWhenDue);
+      document.removeEventListener('visibilitychange', checkWhenDue);
+    };
+  }, [user?.email]);
+
   // Check session validity periodically to enforce one login per operational day.
   useEffect(() => {
     if (!user || !enforceSessionByOperationalDay) return;
@@ -3605,6 +4230,12 @@ function App() {
   }, []);
 
   const getTicketDateKey = useCallback((ticket: LotteryTicket) => {
+    if (ticket.date) {
+      const parsed = new Date(ticket.date);
+      if (!isNaN(parsed.getTime())) {
+        return format(parsed, 'yyyy-MM-dd');
+      }
+    }
     if (ticket.timestamp?.toDate) return format(ticket.timestamp.toDate(), 'yyyy-MM-dd');
     if (ticket.timestamp?.seconds) return format(new Date(ticket.timestamp.seconds * 1000), 'yyyy-MM-dd');
     const parsed = new Date(ticket.timestamp ?? Date.now());
@@ -3897,13 +4528,14 @@ function App() {
     // Calculate start of current business day (3 AM)
     const startOfToday = getStartOfBusinessDay();
 
-    // Fetch TODAY'S tickets for active dashboard
+    // Fetch TODAY'S tickets for active dashboard by business day date.
+    // This ensures tickets with today's date are shown even if timestamp values differ.
     console.log("Fetching today's tickets for user:", user.uid);
 
     if (canAccessAllUsers) {
       const qToday = query(
         collection(db, 'tickets'),
-        where('timestamp', '>=', startOfToday),
+        where('date', '==', businessDayKey),
         limit(2000)
       );
 
@@ -3952,46 +4584,22 @@ function App() {
     }
 
     const sellerEmail = user.email?.toLowerCase();
-    const qTodayBySellerId = query(
+    const qTodayBySeller = query(
       collection(db, 'tickets'),
-      where('sellerId', '==', user.uid),
-      where('timestamp', '>=', startOfToday),
-      limit(500)
+      where('date', '==', businessDayKey),
+      limit(2000)
     );
-    const qTodayBySellerEmail = sellerEmail
-      ? query(
-          collection(db, 'tickets'),
-          where('sellerEmail', '==', sellerEmail),
-          where('timestamp', '>=', startOfToday),
-          limit(500)
-        )
-      : null;
 
-    let sellerIdSnapshot: { docs: Array<{ id: string; data: () => unknown }> } | null = null;
-    let sellerEmailSnapshot: { docs: Array<{ id: string; data: () => unknown }> } | null = null;
-    const publishSellerTickets = () => {
-      const merged = mergeTicketSnapshots(sellerIdSnapshot, sellerEmailSnapshot);
-      console.log("Today's seller tickets fetched successfully:", merged.length);
-      setTickets(merged);
-    };
-
-    const unsubscribeTicketsById = onSnapshot(qTodayBySellerId, (snapshot) => {
-      sellerIdSnapshot = snapshot;
-      publishSellerTickets();
+    const unsubscribeTicketsBySeller = onSnapshot(qTodayBySeller, (snapshot) => {
+      const docs = snapshot.docs
+        .map(docSnap => ({ id: docSnap.id, ...(docSnap.data() as Omit<LotteryTicket, 'id'>) }))
+        .filter(ticket => ticket.sellerId === user.uid || ticket.sellerEmail?.toLowerCase() === sellerEmail);
+      console.log("Today's seller tickets fetched successfully:", docs.length);
+      setTickets(docs);
     }, (error) => {
-      console.error("Error fetching today's tickets by sellerId:", error);
-      handleFirestoreError(error, OperationType.GET, 'tickets_today_by_sellerId');
+      console.error("Error fetching today's tickets by seller:", error);
+      handleFirestoreError(error, OperationType.GET, 'tickets_today_by_seller');
     });
-
-    const unsubscribeTicketsByEmail = qTodayBySellerEmail
-      ? onSnapshot(qTodayBySellerEmail, (snapshot) => {
-          sellerEmailSnapshot = snapshot;
-          publishSellerTickets();
-        }, (error) => {
-          console.error("Error fetching today's tickets by sellerEmail:", error);
-          handleFirestoreError(error, OperationType.GET, 'tickets_today_by_sellerEmail');
-        })
-      : () => {};
 
     // Fetch injections (limit to last 100)
     console.log("Fetching injections for user:", user?.email?.toLowerCase());
@@ -4027,8 +4635,7 @@ function App() {
     });
 
     return () => {
-      unsubscribeTicketsById();
-      unsubscribeTicketsByEmail();
+      unsubscribeTicketsBySeller();
       unsubscribeInjections();
       unsubscribeSettlements();
     };
@@ -4449,6 +5056,14 @@ function App() {
   const confirmSale = async () => {
     if (!user || cart.length === 0 || saleInFlightRef.current) return;
 
+    const currentSellerEmail = user.email?.toLowerCase();
+    if (!currentSellerEmail || (userProfile?.status || 'active') !== 'active') {
+      setShowCheckoutModal(false);
+      toast.error('Usuario inactivo. Contactar al administrador.');
+      await signOut(auth);
+      return;
+    }
+
     saleInFlightRef.current = true;
     setIsSubmittingSale(true);
 
@@ -4514,7 +5129,7 @@ function App() {
           timestamp: serverTimestamp(),
           sellerId: user.uid,
           sellerCode: userProfile?.sellerId || '---',
-          sellerEmail: user?.email?.toLowerCase(),
+          sellerEmail: currentSellerEmail,
           sellerName: userProfile?.name || user.displayName || 'Vendedor',
           commissionRate: userProfile?.commissionRate || 0,
           status: 'active',
@@ -4531,6 +5146,7 @@ function App() {
           timestamp: { toDate: () => new Date() },
           sellerId: user.uid,
           sellerCode: userProfile?.sellerId || '---',
+          sellerEmail: currentSellerEmail,
           sellerName: userProfile?.name || user.displayName || 'Vendedor',
           commissionRate: userProfile?.commissionRate || 0,
           status: 'active',
@@ -5294,6 +5910,100 @@ function App() {
       setIsUpdatingChancePrice(false);
     }
   };
+
+  const loadNativeBluetoothPrinters = async () => {
+    setIsLoadingNativePrinters(true);
+    try {
+      await NativeBluetoothPrinter.requestPermissions();
+      const result = await NativeBluetoothPrinter.listBondedDevices();
+      setNativeBluetoothPrinters(result.devices || []);
+      if (!selectedNativePrinterAddress && result.devices?.length) {
+        setSelectedNativePrinterAddress(result.devices[0].address);
+      }
+      if (!result.devices?.length) {
+        toast.info('No hay impresoras vinculadas. Vincula la impresora en los ajustes Bluetooth de Android.');
+      }
+    } catch (error: any) {
+      console.error('Error loading native printers:', error);
+      toast.error(error?.message || 'No se pudieron leer las impresoras vinculadas');
+    } finally {
+      setIsLoadingNativePrinters(false);
+    }
+  };
+
+  const handleConnectBluetoothPrinter = async () => {
+    setIsConnectingPrinter(true);
+    const toastId = toast.loading('Buscando impresora Bluetooth...');
+    try {
+      if (isNativeAndroid()) {
+        await NativeBluetoothPrinter.requestPermissions();
+        const result = await NativeBluetoothPrinter.listBondedDevices();
+        const devices = result.devices || [];
+        setNativeBluetoothPrinters(devices);
+        const selectedDevice = devices.find(device => device.address === selectedNativePrinterAddress) || devices[0];
+
+        if (!selectedDevice) {
+          throw new Error('No hay impresoras vinculadas. Vincula la impresora en Android y vuelve a intentar.');
+        }
+
+        const config: BluetoothPrinterConfig = {
+          deviceId: selectedDevice.address,
+          deviceAddress: selectedDevice.address,
+          deviceName: selectedDevice.name || 'Impresora Bluetooth',
+          profileId: 'native-spp',
+          serviceUuid: 'native-spp',
+          characteristicUuid: 'native-spp',
+          paperWidth: selectedPrinterPaperWidth,
+          connectedAt: new Date().toISOString()
+        };
+        saveBluetoothPrinterConfig(config);
+        setBluetoothPrinterConfig(config);
+        setSelectedNativePrinterAddress(selectedDevice.address);
+        toast.success(`Impresora guardada: ${config.deviceName}`, { id: toastId });
+        return;
+      }
+
+      const config = await connectBluetoothPrinter(selectedBluetoothPrinterProfileId, selectedPrinterPaperWidth);
+      setBluetoothPrinterConfig(config);
+      setSelectedBluetoothPrinterProfileId(config.profileId);
+      setSelectedPrinterPaperWidth(config.paperWidth);
+      toast.success(`Impresora conectada: ${config.deviceName}`, { id: toastId });
+    } catch (error: any) {
+      console.error('Error connecting Bluetooth printer:', error);
+      toast.error(error?.message || 'No se pudo conectar la impresora', { id: toastId });
+    } finally {
+      setIsConnectingPrinter(false);
+    }
+  };
+
+  const handleTestBluetoothPrinter = async () => {
+    const width = selectedPrinterPaperWidth === '80' ? 42 : 32;
+    const testText = [
+      centerReceiptLine('CHANCE PRO', width),
+      centerReceiptLine('PRUEBA DE IMPRESION', width),
+      '-'.repeat(width),
+      `Fecha: ${format(new Date(), 'dd/MM/yyyy hh:mm a')}`,
+      `Usuario: ${userProfile?.name || userProfile?.email || 'Terminal'}`,
+      '-'.repeat(width),
+      centerReceiptLine('Impresora lista', width)
+    ].join('\n');
+    const toastId = toast.loading('Enviando prueba...');
+    try {
+      await printEscPosText(testText);
+      toast.success('Prueba enviada a la impresora', { id: toastId });
+    } catch (error: any) {
+      console.error('Error testing Bluetooth printer:', error);
+      toast.error(error?.message || 'No se pudo imprimir la prueba', { id: toastId });
+    }
+  };
+
+  const handleForgetBluetoothPrinter = () => {
+    saveBluetoothPrinterConfig(null);
+    setBluetoothPrinterConfig(null);
+    setSelectedNativePrinterAddress('');
+    toast.success('Impresora eliminada de esta terminal');
+  };
+
   const saveUser = async (userProfileData: UserProfile, password?: string) => {
     const rawEmail = userProfileData.email.toLowerCase();
     const authEmail = rawEmail.includes('@') ? rawEmail : `${rawEmail}@chancepro.local`;
@@ -6681,6 +7391,11 @@ Diferencia: ${signedCurrency(difference)}`,
     return groups;
   }, [settlements]);
 
+  const toggleShowAllToday = useCallback((v: boolean) => {
+    try { localStorage.setItem('enableShowAllToday', JSON.stringify(Boolean(v))); } catch (e) {}
+    setEnableShowAllToday(Boolean(v));
+  }, []);
+
   const filteredTickets = useMemo(() => {
     const todayStr = businessDayKey;
     const source = activeTab === 'history' 
@@ -6688,8 +7403,7 @@ Diferencia: ${signedCurrency(difference)}`,
       : tickets;
 
     return source.filter(t => {
-      const tDate = t.timestamp?.toDate ? t.timestamp.toDate() : (t.timestamp?.seconds ? new Date(t.timestamp.seconds * 1000) : new Date());
-      const ticketDate = format(tDate, 'yyyy-MM-dd');
+      const ticketDate = getTicketDateKey(t);
       const matchesDate = activeTab === 'history' ? ticketDate === historyDate : true;
       
       const matchesUser = canAccessAllUsers || t.sellerId === user?.uid || t.sellerEmail?.toLowerCase() === user?.email?.toLowerCase();
@@ -6715,10 +7429,15 @@ Diferencia: ${signedCurrency(difference)}`,
     if (activeTab !== 'history') return [];
 
     return sortedLotteries.map(lot => {
-      const ticketsForLot = filteredTickets.filter(ticket =>
-        ticket.status !== 'cancelled' &&
-        ticket.bets && ticket.bets.some(bet => bet && cleanText(bet.lottery) === cleanText(lot.name) && (!historyTypeFilterCode || bet.type === historyTypeFilterCode))
-      );
+      const ticketsForLot = filteredTickets.filter(ticket => {
+        const matchesLottery = ticket.bets && ticket.bets.some(bet => bet && cleanText(bet.lottery) === cleanText(lot.name) && (!historyTypeFilterCode || bet.type === historyTypeFilterCode));
+        if (!matchesLottery) return false;
+        // If viewing today's history and the toggle is off, keep excluding cancelled to preserve previous UX
+        if (historyDate === businessDayKey && !enableShowAllToday) {
+          return ticket.status !== 'cancelled';
+        }
+        return true;
+      });
       if (!ticketsForLot.length) return null;
 
       const resultForLottery = results.find(result => result.lotteryId === lot.id && result.date === historyDate);
@@ -6777,7 +7496,10 @@ Diferencia: ${signedCurrency(difference)}`,
   const historyStats = useMemo(() => {
     if (activeTab !== 'history') return null;
     
-    const hTickets = filteredTickets.filter(t => t.status !== 'cancelled');
+    const hTickets = filteredTickets.filter(t => {
+      if (historyDate === businessDayKey && !enableShowAllToday) return t.status !== 'cancelled';
+      return true;
+    });
     
     const sales = hTickets.reduce((acc, t) => {
       const lotBets = (t.bets || []);
@@ -6965,6 +7687,115 @@ Diferencia: ${signedCurrency(difference)}`,
     });
     return names;
   }, []);
+
+  const parseTicketQrValue = useCallback((value: string) => {
+    const cleaned = (value || '').trim();
+    if (!cleaned) return { ticketId: '', ticketDate: '' };
+
+    if (cleaned.toLowerCase().startsWith('ticket:')) {
+      const [, ticketId = '', ticketDate = ''] = cleaned.split(':');
+      return {
+        ticketId: ticketId.trim(),
+        ticketDate: ticketDate.trim()
+      };
+    }
+
+    return {
+      ticketId: cleaned,
+      ticketDate: ''
+    };
+  }, []);
+
+  const findLoadedTicketsByIdPrefix = useCallback((ticketIdPrefix: string) => {
+    const normalizedPrefix = ticketIdPrefix.trim().toLowerCase();
+    if (!normalizedPrefix) return [];
+
+    const seen = new Set<string>();
+    return [...tickets, ...historyTickets, ...archiveTickets].filter(ticket => {
+      const matches = ticket.id.toLowerCase().startsWith(normalizedPrefix);
+      if (!matches || seen.has(ticket.id)) return false;
+      seen.add(ticket.id);
+      return true;
+    });
+  }, [archiveTickets, historyTickets, tickets]);
+
+  const handleTicketQrScan = useCallback(async (rawValue: string) => {
+    const { ticketId, ticketDate } = parseTicketQrValue(rawValue);
+    const ticketIdPrefix = ticketId.trim();
+
+    if (ticketIdPrefix.length < 6) {
+      toast.error('Ingresa al menos los primeros 6 caracteres del ticket');
+      return;
+    }
+
+    setShowTicketScanner(false);
+
+    const loadedMatches = findLoadedTicketsByIdPrefix(ticketIdPrefix);
+    if (loadedMatches.length === 1) {
+      setShowTicketModal({ ticket: loadedMatches[0] });
+      toast.success('Ticket verificado');
+      return;
+    }
+    if (loadedMatches.length > 1) {
+      toast.error('Hay varios tickets con ese inicio. Ingresa mas caracteres.');
+      return;
+    }
+
+    const toastId = toast.loading('Buscando ticket...');
+    try {
+      if (ticketIdPrefix.length >= 12) {
+        const liveSnap = await getDoc(doc(db, 'tickets', ticketIdPrefix));
+        if (liveSnap.exists()) {
+          setShowTicketModal({ ticket: { id: liveSnap.id, ...liveSnap.data() } as LotteryTicket });
+          toast.success('Ticket verificado', { id: toastId });
+          return;
+        }
+      }
+
+      const liveMatchesSnap = await getDocs(query(
+        collection(db, 'tickets'),
+        where(documentId(), '>=', ticketIdPrefix),
+        where(documentId(), '<=', `${ticketIdPrefix}\uf8ff`),
+        limit(2)
+      ));
+
+      if (liveMatchesSnap.size === 1) {
+        const ticketDoc = liveMatchesSnap.docs[0];
+        setShowTicketModal({ ticket: { id: ticketDoc.id, ...ticketDoc.data() } as LotteryTicket });
+        toast.success('Ticket verificado', { id: toastId });
+        return;
+      }
+
+      if (liveMatchesSnap.size > 1) {
+        toast.error('Hay varios tickets con ese inicio. Ingresa mas caracteres.', { id: toastId });
+        return;
+      }
+
+      if (ticketDate) {
+        const archiveSnap = await getDoc(doc(db, 'daily_archives', ticketDate));
+        if (archiveSnap.exists()) {
+          const archiveData = archiveSnap.data() as { tickets?: LotteryTicket[] };
+          const archivedMatches = (archiveData.tickets || []).filter(ticket =>
+            ticket.id.toLowerCase().startsWith(ticketIdPrefix.toLowerCase())
+          );
+          if (archivedMatches.length === 1) {
+            setShowTicketModal({ ticket: archivedMatches[0] });
+            toast.success('Ticket verificado desde archivo', { id: toastId });
+            return;
+          }
+          if (archivedMatches.length > 1) {
+            toast.error('Hay varios tickets archivados con ese inicio. Ingresa mas caracteres.', { id: toastId });
+            return;
+          }
+        }
+      }
+
+      toast.error('No se encontro el ticket original', { id: toastId });
+    } catch (error: any) {
+      console.error('Error verifying ticket QR:', error);
+      toast.error(error?.message || 'No se pudo verificar el ticket', { id: toastId });
+    }
+  }, [findLoadedTicketsByIdPrefix, parseTicketQrValue]);
 
   const recoveryAvailableLotteries = useMemo(() => {
     return [...lotteries]
@@ -7466,6 +8297,12 @@ Diferencia: ${signedCurrency(difference)}`,
           onClose={() => setShowTicketModal(null)} 
         />
       )}
+
+      <TicketQrScannerModal
+        show={showTicketScanner}
+        onClose={() => setShowTicketScanner(false)}
+        onScan={handleTicketQrScan}
+      />
 
       <ConfirmationModal 
         show={confirmModal.show}
@@ -8217,20 +9054,37 @@ Diferencia: ${signedCurrency(difference)}`,
                     <div className="flex items-center gap-3">
                       <h2 className="text-[10px] font-black text-white uppercase tracking-[0.2em]">RESUMEN DE VENTAS</h2>
                     </div>
-                    <div className="flex gap-1 bg-black/40 p-1 rounded-full border border-white/5 overflow-x-auto custom-scrollbar">
-                      {['TODO', 'CHANCE', 'BILLETE', 'PALE'].map((f) => (
+                    <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                      <button
+                        type="button"
+                        onClick={() => setShowTicketScanner(true)}
+                        className="flex items-center justify-center gap-2 bg-primary/15 text-primary border border-primary/20 px-4 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest hover:bg-primary/25 transition-all"
+                      >
+                        <ScanQrCode className="w-3.5 h-3.5" />
+                        Verificar QR
+                      </button>
+                      <div className="flex gap-1 bg-black/40 p-1 rounded-full border border-white/5 overflow-x-auto custom-scrollbar">
+                        {['TODO', 'CHANCE', 'BILLETE', 'PALE'].map((f) => (
+                          <button
+                            key={f}
+                            onClick={() => setHistoryFilter(f as any)}
+                            className={`px-4 py-2.5 rounded-full text-[10px] font-black transition-all whitespace-nowrap ${
+                              historyFilter === f 
+                                ? 'bg-primary text-white shadow-lg shadow-primary/20' 
+                                : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                          >
+                            {f}
+                          </button>
+                        ))}
                         <button
-                          key={f}
-                          onClick={() => setHistoryFilter(f as any)}
-                          className={`px-4 py-2.5 rounded-full text-[10px] font-black transition-all whitespace-nowrap ${
-                            historyFilter === f 
-                              ? 'bg-primary text-white shadow-lg shadow-primary/20' 
-                              : 'text-muted-foreground hover:text-foreground'
-                          }`}
+                          type="button"
+                          onClick={() => toggleShowAllToday(!enableShowAllToday)}
+                          className={`ml-2 px-3 py-2 rounded-full text-[10px] font-black transition-all whitespace-nowrap ${enableShowAllToday ? 'bg-emerald-600 text-white' : 'bg-transparent text-muted-foreground border border-white/5'}`}
                         >
-                          {f}
+                          {enableShowAllToday ? 'Mostrar todos (Hoy)' : 'Ocultar cancelados (Hoy)'}
                         </button>
-                      ))}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -10487,7 +11341,7 @@ Diferencia: ${signedCurrency(difference)}`,
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
                     <div className="glass-card p-6 border-white/5 bg-white/[0.02] space-y-6">
                       <div className="flex items-center gap-3 border-b border-white/5 pb-4">
                         <div className="p-2 rounded-lg bg-primary/20 text-primary">
@@ -10528,6 +11382,127 @@ Diferencia: ${signedCurrency(difference)}`,
                           {isUpdatingChancePrice ? 'Actualizando...' : 'Guardar Precio de Chance'}
                         </button>
                       </form>
+                    </div>
+
+                    <div className="glass-card p-6 border-white/5 bg-white/[0.02] space-y-6">
+                      <div className="flex items-center gap-3 border-b border-white/5 pb-4">
+                        <div className="p-2 rounded-lg bg-emerald-500/20 text-emerald-400">
+                          <Printer className="w-5 h-5" />
+                        </div>
+                        <h3 className="font-black uppercase tracking-widest text-sm">Impresora Bluetooth</h3>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+                          <p className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">Estado</p>
+                          <p className="mt-1 text-sm font-bold">
+                            {bluetoothPrinterConfig ? bluetoothPrinterConfig.deviceName : 'Sin impresora conectada'}
+                          </p>
+                          {bluetoothPrinterConfig && (
+                            <p className="mt-1 text-[10px] font-mono text-muted-foreground uppercase">
+                              Papel {bluetoothPrinterConfig.paperWidth}mm
+                            </p>
+                          )}
+                        </div>
+
+                        {isNativeAndroid() ? (
+                          <div className="space-y-3">
+                            <button
+                              type="button"
+                              onClick={loadNativeBluetoothPrinters}
+                              disabled={isLoadingNativePrinters}
+                              className="w-full bg-white/5 border border-white/10 text-white py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-white/10 transition-all disabled:opacity-50"
+                            >
+                              {isLoadingNativePrinters ? 'Buscando...' : 'Buscar Vinculadas'}
+                            </button>
+
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">Impresora vinculada</label>
+                              <select
+                                value={selectedNativePrinterAddress}
+                                onChange={(e) => setSelectedNativePrinterAddress(e.target.value)}
+                                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-primary transition-all"
+                              >
+                                <option value="">Seleccionar...</option>
+                                {nativeBluetoothPrinters.map(device => (
+                                  <option key={device.address} value={device.address}>
+                                    {device.name || 'Impresora Bluetooth'} ({device.address})
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => NativeBluetoothPrinter.openBluetoothSettings()}
+                              className="w-full bg-white/5 border border-white/10 text-white py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-white/10 transition-all"
+                            >
+                              Abrir Bluetooth
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            <label className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">Tipo de conexion</label>
+                            <select
+                              value={selectedBluetoothPrinterProfileId}
+                              onChange={(e) => setSelectedBluetoothPrinterProfileId(e.target.value)}
+                              className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-primary transition-all"
+                            >
+                              {BLUETOOTH_PRINTER_PROFILES.map(profile => (
+                                <option key={profile.id} value={profile.id}>
+                                  {profile.label}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">Ancho de papel</label>
+                          <select
+                            value={selectedPrinterPaperWidth}
+                            onChange={(e) => setSelectedPrinterPaperWidth(e.target.value as PrinterPaperWidth)}
+                            className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-primary transition-all"
+                          >
+                            <option value="58">58 mm</option>
+                            <option value="80">80 mm</option>
+                          </select>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={handleConnectBluetoothPrinter}
+                          disabled={isConnectingPrinter}
+                          className="w-full bg-primary text-primary-foreground py-3 rounded-xl font-black uppercase tracking-widest text-xs hover:bg-primary/90 transition-all disabled:opacity-50"
+                        >
+                          {isConnectingPrinter ? 'Conectando...' : 'Conectar Impresora'}
+                        </button>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={handleTestBluetoothPrinter}
+                            disabled={!bluetoothPrinterConfig}
+                            className="bg-white/5 border border-white/10 text-white py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-white/10 transition-all disabled:opacity-50"
+                          >
+                            Probar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleForgetBluetoothPrinter}
+                            disabled={!bluetoothPrinterConfig}
+                            className="bg-red-500/10 border border-red-500/20 text-red-400 py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-red-500/20 transition-all disabled:opacity-50"
+                          >
+                            Olvidar
+                          </button>
+                        </div>
+
+                        <p className="text-[10px] text-muted-foreground leading-relaxed">
+                          {isNativeAndroid()
+                            ? 'En el APK usa impresoras termicas ESC/POS vinculadas por Bluetooth en Android.'
+                            : 'En navegador usa impresoras termicas ESC/POS BLE. En Chrome Android debe abrirse por HTTPS.'}
+                        </p>
+                      </div>
                     </div>
 
                     {/* Seguridad */}
