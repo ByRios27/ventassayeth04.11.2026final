@@ -11,7 +11,6 @@ const COLLECTION_ORDER = [
   'lotteries',
   'results',
   'tickets',
-  'injections',
   'settlements',
 ];
 

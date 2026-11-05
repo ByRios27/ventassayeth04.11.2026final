@@ -386,7 +386,7 @@ export const Cierres: React.FC<CierresProps> = ({ tickets, lotteries, userProfil
 
       <div className="glass-card p-6 border-white/5 bg-white/[0.02] flex flex-col sm:flex-row gap-4 items-end">
         <div className="w-full sm:w-1/2 space-y-2">
-          <label className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">Seleccionar Sorteo</label>
+          <label className="text-xs font-mono font-bold uppercase tracking-widest text-muted-foreground">Seleccionar Sorteo</label>
           <select 
             value={selectedLotteryId}
             onChange={(e) => {

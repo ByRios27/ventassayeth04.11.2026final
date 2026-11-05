@@ -11,4 +11,7 @@ credentials/
 *.service-account.json
 scripts/.env
 firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.emulator-data/
 auth-users-old.json

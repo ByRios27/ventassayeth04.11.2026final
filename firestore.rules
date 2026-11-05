@@ -182,13 +182,6 @@ service cloud.firestore {
       allow write: if isCeo() || isAdmin() || isProgramador();
     }
 
-    match /injections/{injectionId} {
-      allow read: if isAuthenticated() && (canReadAllSalesData() || resource.data.get('userEmail', '').lower() == currentUserEmail());
-      allow create: if isCeo() || isAdmin() || isProgramador();
-      allow update: if isCeo() || isAdmin() || isProgramador();
-      allow delete: if isCeo() || isProgramador();
-    }
-
     match /settlements/{settlementId} {
       allow read: if isAuthenticated() && (canReadAllSalesData() || resource.data.get('userEmail', '').lower() == currentUserEmail());
       allow write: if isCeo() || isAdmin() || isProgramador();

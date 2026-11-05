@@ -63,21 +63,6 @@
       },
       "required": ["lotteryName", "date", "firstPrize", "timestamp"]
     },
-    "Injection": {
-      "title": "Financial Transaction",
-      "description": "A record of an injection, payment, or debt transaction.",
-      "type": "object",
-      "properties": {
-        "userEmail": { "type": "string", "format": "email" },
-        "amount": { "type": "number" },
-        "type": { "type": "string", "enum": ["injection", "payment", "debt"] },
-        "date": { "type": "string", "format": "date" },
-        "timestamp": { "type": "string", "format": "date-time" },
-        "addedBy": { "type": "string" },
-        "liquidated": { "type": "boolean" }
-      },
-      "required": ["userEmail", "amount", "type", "date", "timestamp", "addedBy"]
-    },
     "Settlement": {
       "title": "Daily Settlement",
       "description": "A summary of daily sales and profits for a user.",
@@ -89,7 +74,6 @@
         "totalCommission": { "type": "number" },
         "totalPrizes": { "type": "number" },
         "netProfit": { "type": "number" },
-        "injections": { "type": "number" },
         "bankProfit": { "type": "number" },
         "timestamp": { "type": "string", "format": "date-time" },
         "liquidated": { "type": "boolean" }
@@ -129,10 +113,6 @@
     "results": {
       "schema": { "$ref": "Result" },
       "description": "Collection of lottery results."
-    },
-    "injections": {
-      "schema": { "$ref": "Injection" },
-      "description": "Collection of financial transactions (injections, payments, debts)."
     },
     "settlements": {
       "schema": { "$ref": "Settlement" },

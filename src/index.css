@@ -3,7 +3,8 @@
 
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-mono: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-terminal: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   
   --color-background: #000000;
   --color-foreground: #ffffff;
