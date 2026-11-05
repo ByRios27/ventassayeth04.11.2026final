@@ -177,6 +177,15 @@ service cloud.firestore {
         );
     }
 
+    match /comboCounters/{counterId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated()
+        && request.resource.data.keys().hasOnly(['businessDate', 'type', 'lottery', 'amounts', 'updatedAt'])
+        && request.resource.data.amounts is map
+        && request.resource.data.type in ['PL', 'BL'];
+      allow delete: if isCeo() || isProgramador();
+    }
+
     match /results/{resultId} {
       allow read: if isAuthenticated();
       allow write: if isCeo() || isAdmin() || isProgramador();

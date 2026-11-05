@@ -1,6 +1,9 @@
 import { getApps, initializeApp } from "firebase/app";
 import { 
   getFirestore, 
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   collection, 
   addDoc, 
   setDoc,
@@ -57,7 +60,17 @@ const app = getApps().find(existingApp => existingApp.name === '[DEFAULT]')
   ?? initializeApp(firebaseConfig);
 const secondaryApp = getApps().find(existingApp => existingApp.name === 'secondary')
   ?? initializeApp(firebaseConfig, 'secondary');
-export const db = getFirestore(app);
+// Caché local persistente: al reabrir la app o reiniciar un listener solo se leen los documentos que cambiaron.
+export const db = (() => {
+  if (useEmulators) return getFirestore(app);
+  try {
+    return initializeFirestore(app, {
+      localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+    });
+  } catch {
+    return getFirestore(app);
+  }
+})();
 if (useEmulators) {
   try {
     connectFirestoreEmulator(db, '127.0.0.1', 8080);

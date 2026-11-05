@@ -8,6 +8,14 @@
     ],
     "headers": [
       {
+        "source": "/time.txt",
+        "headers": [
+          { "key": "Cache-Control", "value": "no-store" },
+          { "key": "Access-Control-Allow-Origin", "value": "*" },
+          { "key": "Access-Control-Expose-Headers", "value": "Date" }
+        ]
+      },
+      {
         "source": "/manifest.webmanifest",
         "headers": [
           {

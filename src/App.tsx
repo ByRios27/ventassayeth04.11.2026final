@@ -31,6 +31,7 @@ import {
   runTransaction
 } from './firebase';
 import { onAuthStateChanged } from 'firebase/auth';
+import type { Transaction } from 'firebase/firestore';
 import type { User } from 'firebase/auth';
 import { format } from 'date-fns';
 import { 
@@ -2214,7 +2215,7 @@ const LotteryModal = ({ show, lottery, onSave, onClose, globalSettings }: {
       <motion.div 
         initial={{ scale: 0.9, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
-        className="glass-card max-w-md w-full p-4 md:p-8 max-h-[90vh] overflow-y-auto custom-scrollbar"
+        className="glass-card max-w-md w-full p-4 md:p-8 max-h-[92vh] overflow-y-auto custom-scrollbar"
       >
         <div className="flex justify-between items-center mb-6">
           <h3 className="text-xl font-black uppercase tracking-tighter italic">
@@ -2459,17 +2460,17 @@ const ComboLimitFields = ({ limit, setLimit, fixed, setFixed }: {
       />
     </div>
     <div className="bg-black/20 px-2 py-1.5 rounded-lg">
-      <label className="text-[10px] font-mono font-bold uppercase text-muted-foreground block">Costos fijos (opcional)</label>
+      <label className="text-[10px] font-mono font-bold uppercase text-muted-foreground block">Costo fijo (opcional)</label>
       <input
         type="text"
-        placeholder="Ej: 0.25, 0.50, 1"
+        placeholder="Ej: 1"
         value={fixed}
         onChange={(e) => setFixed(e.target.value)}
         className="w-full bg-transparent border-none p-0 text-sm font-bold focus:outline-none focus:ring-0"
       />
     </div>
     <p className="col-span-2 text-[11px] font-semibold text-muted-foreground italic">
-      Sin costos fijos se permite cualquier monto desde $0.10 hasta el límite. Al superar el límite de una misma combinación, la venta se bloquea.
+      El límite es lo máximo que se vende por combinación entre todos los vendedores. El costo fijo es el monto mínimo y el paso: con $1 solo se factura 1, 2, 3... (no 1.50). Sin costo fijo se permite desde $0.10. Al superar el límite la venta se bloquea.
     </p>
   </div>
 );
@@ -2495,7 +2496,7 @@ const GlobalSettingsModal = ({ show, settings, onSave, onClose, section, inline 
   const [palesFixed, setPalesFixed] = useState((settings.palesFixedAmounts || []).join(', '));
   const [billetesFixed, setBilletesFixed] = useState((settings.billetesFixedAmounts || []).join(', '));
   const parseFixedAmounts = (raw: string) =>
-    Array.from(new Set(raw.split(/[\s,;]+/).map(v => parseFloat(v)).filter(v => !Number.isNaN(v) && v >= 0.10))).sort((a, b) => a - b);
+    Array.from(new Set(raw.split(/[\s,;]+/).map(v => parseFloat(v)).filter(v => !Number.isNaN(v) && v >= 0.10))).sort((a, b) => a - b).slice(0, 1);
   const defaultBilletePrizes = {
     full4: 2000,
     first3: 200,
@@ -2857,7 +2858,32 @@ const CheckoutModal = ({ show, customerName, setCustomerName, onConfirm, onClose
 const getUserLabel = (u?: { name?: string; email?: string } | null) =>
   u?.email?.split('@')[0]?.trim() || u?.name?.trim() || '';
 
-const getBusinessDate = (date = new Date()) => {
+// Reloj del servidor: se calibra con la cabecera Date del hosting (sin lecturas de Firestore)
+// y avanza con performance.now(), que no cambia si el usuario modifica la hora del dispositivo.
+let serverClockBase: { server: number; perf: number } | null = null;
+
+const serverNowMs = () => serverClockBase
+  ? serverClockBase.server + (performance.now() - serverClockBase.perf)
+  : Date.now();
+
+const serverNow = () => new Date(serverNowMs());
+
+const syncServerClock = async (): Promise<boolean> => {
+  try {
+    const perfStart = performance.now();
+    const response = await fetch(`/time.txt?t=${Date.now()}`, { method: 'HEAD', cache: 'no-store' });
+    const dateHeader = response.headers.get('Date');
+    const serverMs = dateHeader ? new Date(dateHeader).getTime() : NaN;
+    if (!response.ok || Number.isNaN(serverMs)) return serverClockBase !== null;
+    const perfEnd = performance.now();
+    serverClockBase = { server: serverMs + (perfEnd - perfStart) / 2, perf: perfEnd };
+    return true;
+  } catch {
+    return serverClockBase !== null;
+  }
+};
+
+const getBusinessDate = (date = serverNow()) => {
   const hours = date.getHours();
   if (hours < 3) {
     const prevDate = new Date(date);
@@ -2867,14 +2893,14 @@ const getBusinessDate = (date = new Date()) => {
   return date;
 };
 
-const getStartOfBusinessDay = (date = new Date()) => {
+const getStartOfBusinessDay = (date = serverNow()) => {
   const businessDate = getBusinessDate(date);
   const start = new Date(businessDate);
   start.setHours(3, 0, 0, 0);
   return start;
 };
 
-const getEndOfBusinessDay = (date = new Date()) => {
+const getEndOfBusinessDay = (date = serverNow()) => {
   const start = getStartOfBusinessDay(date);
   const end = new Date(start);
   end.setDate(start.getDate() + 1);
@@ -3676,8 +3702,10 @@ function App() {
 
   const [tick, setTick] = useState(0);
   useEffect(() => {
+    void syncServerClock();
     const interval = setInterval(() => setTick(t => t + 1), 60000);
-    return () => clearInterval(interval);
+    const clockInterval = setInterval(() => { void syncServerClock(); }, 5 * 60000);
+    return () => { clearInterval(interval); clearInterval(clockInterval); };
   }, []);
 
   const businessDayKey = useMemo(() => format(getBusinessDate(), 'yyyy-MM-dd'), [tick]);
@@ -4477,21 +4505,13 @@ function App() {
     (async () => {
       try {
         const targetBusinessDay = getQuickOperationalDate(-1);
-        const result = await runOperationalArchiveAndCleanup({
+        await runOperationalArchiveAndCleanup({
           targetBusinessDay,
           trigger: 'automatic'
         });
-
         localStorage.setItem(autoCleanupStorageKey, todayKey);
-
-        if (result.deletedCount > 0 || !result.archiveAlreadyExists) {
-          toast.success(`Limpieza autom?tica 4:30 AM completada (${targetBusinessDay})`);
-        } else {
-          toast.info(`Limpieza autom?tica validada (${targetBusinessDay}, sin cambios pendientes)`);
-        }
       } catch (error) {
-        console.error('Error en limpieza autom?tica 4:30 AM:', error);
-        toast.error('Fall? la limpieza autom?tica de las 4:30 AM. Se reintentar? autom?ticamente.');
+        console.error('Error en limpieza automatica:', error);
       } finally {
         autoCleanupRunningRef.current = false;
       }
@@ -4515,6 +4535,7 @@ function App() {
     const unsubscribeLotteries = onSnapshot(qLot, async (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Lottery));
       setLotteries(docs);
+      historyDataCacheRef.current.clear();
       
       // Use sorted lotteries to pick the first active one by time
       if (docs.length > 0 && !selectedLottery) {
@@ -4539,6 +4560,7 @@ function App() {
         console.log("Global settings fetched successfully");
         const data = snapshot.id ? { id: snapshot.id, ...snapshot.data() } as GlobalSettings : snapshot.data() as GlobalSettings;
         setGlobalSettings(data);
+        historyDataCacheRef.current.clear();
       } else {
         console.warn("Global settings document not found");
         // If CEO is logged in and settings are missing, initialize them
@@ -4613,39 +4635,19 @@ function App() {
     if (canAccessAllUsers) {
       // Tickets from some clients have no `date` field, so also query by timestamp range.
       const { start: dayStart, end: dayEnd } = getBusinessDayRange(businessDayKey);
-      const qTodayByDate = query(
-        collection(db, 'tickets'),
-        where('date', '==', businessDayKey),
-        limit(2000)
-      );
+      // Una sola consulta por rango de timestamp (todos los tickets lo tienen): evita leer dos veces cada ticket.
       const qTodayByTime = query(
         collection(db, 'tickets'),
         where('timestamp', '>=', dayStart),
         where('timestamp', '<', dayEnd),
         limit(2000)
       );
-      let byDateSnap: { docs: Array<{ id: string; data: () => unknown }> } | null = null;
-      let byTimeSnap: { docs: Array<{ id: string; data: () => unknown }> } | null = null;
-      const publish = () => setTickets(mergeTicketSnapshots(byDateSnap, byTimeSnap));
-
-      const unsubscribeByDate = onSnapshot(qTodayByDate, (snapshot) => {
-        byDateSnap = snapshot;
-        publish();
+      const unsubscribeTickets = onSnapshot(qTodayByTime, (snapshot) => {
+        setTickets(mergeTicketSnapshots(null, snapshot));
       }, (error) => {
         console.error("Error fetching today's tickets:", error);
         handleFirestoreError(error, OperationType.GET, 'tickets_today');
       });
-      const unsubscribeByTime = onSnapshot(qTodayByTime, (snapshot) => {
-        byTimeSnap = snapshot;
-        publish();
-      }, (error) => {
-        console.error("Error fetching today's tickets by time:", error);
-      });
-      const unsubscribeTickets = () => {
-        unsubscribeByDate();
-        unsubscribeByTime();
-      };
-
       console.log("Fetching settlements for user:", user?.email?.toLowerCase());
       const qSettlements = query(
         collection(db, 'settlements'),
@@ -4670,6 +4672,7 @@ function App() {
     const sellerEmail = user.email?.toLowerCase();
     const qTodayBySeller = query(
       collection(db, 'tickets'),
+      where('sellerId', '==', user.uid),
       where('date', '==', businessDayKey),
       limit(2000)
     );
@@ -4920,26 +4923,25 @@ function App() {
       .filter(b => b && b.type === type && b.number === num && cleanText(b.lottery) === cleanText(lot))
       .reduce((acc, b) => acc + (b.amount || 0), 0);
 
-  // Valida el costo por unidad (rango 0.10 - límite, o costos fijos si están definidos)
-  const validateComboUnitCost = (type: 'PL' | 'BL', unitCost: number) => {
-    const { limit: comboLimit, fixed } = getComboRules(type);
+  // Costo fijo = monto mínimo y paso: solo se factura en múltiplos de ese valor (1, 2, 3...) hasta el límite global.
+  // Sin costo fijo se acepta cualquier monto desde 0.10. Superar el límite lo valida exceedsComboLimit.
+  const validateComboUnitCost = (type: 'PL' | 'BL', totalAmount: number, unitCost: number = totalAmount) => {
+    const { fixed } = getComboRules(type);
+    const step = fixed.length > 0 ? Math.min(...fixed) : 0;
     const label = type === 'PL' ? 'Palé' : 'Billete';
-    if (Number.isNaN(unitCost) || unitCost < 0.10) {
+    if (Number.isNaN(unitCost) || Number.isNaN(totalAmount) || unitCost < 0.10) {
       toast.error(`El mínimo para ${label} es USD 0.10`);
       return false;
     }
-    if (fixed.length > 0) {
-      if (!fixed.some(v => Math.abs(v - unitCost) < 0.005)) {
-        toast.error(`${label}: solo se permiten los costos ${fixed.map(v => `$${v.toFixed(2)}`).join(', ')}`);
+    if (step > 0) {
+      const multiple = Math.round(totalAmount / step);
+      if (totalAmount < step - 0.005 || Math.abs(multiple * step - totalAmount) > 0.005) {
+        toast.error(`${label}: el costo fijo es $${step.toFixed(2)}. Solo se factura de ${step.toFixed(2)} en ${step.toFixed(2)} ($${step.toFixed(2)}, $${(step * 2).toFixed(2)}, $${(step * 3).toFixed(2)}...). Corrija el monto o quite la jugada.`);
         return false;
       }
-    } else if (unitCost > comboLimit + 0.0001) {
-      toast.error(`${label}: el costo debe estar entre USD 0.10 y USD ${comboLimit.toFixed(2)}`);
-      return false;
     }
     return true;
   };
-
   // Bloquea si lo vendido + lo que está en el carrito + lo nuevo supera el límite de la combinación exacta
   const exceedsComboLimit = (type: 'PL' | 'BL', num: string, lot: string, addAmount: number, cartItems: Bet[]) => {
     const { limit: comboLimit } = getComboRules(type);
@@ -4949,12 +4951,81 @@ function App() {
     const sold = getComboSold(type, num, lot);
     if (sold + inCart + addAmount > comboLimit + 0.0001) {
       const available = Math.max(0, comboLimit - sold - inCart);
-      toast.error(`Límite alcanzado: ${type === 'PL' ? 'Palé' : 'Billete'} ${num} en ${cleanText(lot)} admite máximo USD ${comboLimit.toFixed(2)} (disponible USD ${available.toFixed(2)})`);
+      toast.error(`Límite alcanzado: ${type === 'PL' ? 'Palé' : 'Billete'} ${num} en ${cleanText(lot)} admite máximo USD ${comboLimit.toFixed(2)} (disponible USD ${available.toFixed(2)}). Corrija el monto o quite la jugada.`);
       return true;
     }
     return false;
   };
 
+  // Contador global: 1 documento por día + sorteo + tipo con un mapa número -> monto.
+  // Una venta lee/escribe como máximo 1 documento por sorteo y tipo (no uno por combinación).
+  const groupCombos = (bets: Bet[], dayKey: string) => {
+    const groups = new Map<string, { type: 'PL' | 'BL'; lottery: string; numbers: Map<string, number> }>();
+    (bets || []).forEach(b => {
+      if (!b || (b.type !== 'PL' && b.type !== 'BL')) return;
+      const lottery = cleanText(b.lottery);
+      const id = encodeURIComponent(`${dayKey}|${b.type}|${lottery}`);
+      const group = groups.get(id) || { type: b.type, lottery, numbers: new Map<string, number>() };
+      group.numbers.set(b.number, (group.numbers.get(b.number) || 0) + (b.amount || 0));
+      groups.set(id, group);
+    });
+    return groups;
+  };
+
+  // Se valida y actualiza en la misma transacción que guarda/borra el ticket.
+  const commitWithComboCounters = async (
+    newBets: Bet[],
+    oldBets: Bet[],
+    write: (transaction: Transaction) => void
+  ) => {
+    const dayKey = format(getBusinessDate(), 'yyyy-MM-dd');
+    const next = groupCombos(newBets, dayKey);
+    const prev = groupCombos(oldBets, dayKey);
+    const ids = Array.from(new Set([...next.keys(), ...prev.keys()]));
+    if (ids.length === 0) {
+      await runTransaction(db, async (transaction) => { write(transaction); });
+      return;
+    }
+    await runTransaction(db, async (transaction) => {
+      const snaps = await Promise.all(ids.map(id => transaction.get(doc(db, 'comboCounters', id))));
+      const writes: { id: string; type: 'PL' | 'BL'; lottery: string; amounts: Record<string, number> }[] = [];
+      ids.forEach((id, i) => {
+        const nextGroup = next.get(id);
+        const prevGroup = prev.get(id);
+        const type = (nextGroup || prevGroup)!.type;
+        const lottery = (nextGroup || prevGroup)!.lottery;
+        const stored: Record<string, number> | null = snaps[i].exists() ? (snaps[i].data()?.amounts || {}) : null;
+        const { limit: comboLimit } = getComboRules(type);
+        const numbers = new Set([...(nextGroup?.numbers.keys() || []), ...(prevGroup?.numbers.keys() || [])]);
+        const changed: Record<string, number> = {};
+        numbers.forEach(num => {
+          const newAmount = nextGroup?.numbers.get(num) || 0;
+          const oldAmount = prevGroup?.numbers.get(num) || 0;
+          if (newAmount === oldAmount) return;
+          const base = stored
+            ? Math.max(0, (Number(stored[num]) || 0) - oldAmount)
+            : getComboSold(type, num, lottery);
+          const total = base + newAmount;
+          if (newAmount > oldAmount && total > comboLimit + 0.0001) {
+            const available = Math.max(0, comboLimit - base);
+            throw new Error(`COMBO_LIMIT:Límite alcanzado: ${type === 'PL' ? 'Palé' : 'Billete'} ${num} en ${lottery} admite máximo USD ${comboLimit.toFixed(2)} (disponible USD ${available.toFixed(2)}). Corrija el monto o quite la jugada.`);
+          }
+          changed[num] = Number(total.toFixed(2));
+        });
+        if (Object.keys(changed).length > 0) writes.push({ id, type, lottery, amounts: changed });
+      });
+      writes.forEach(({ id, type, lottery, amounts }) => {
+        transaction.set(doc(db, 'comboCounters', id), {
+          businessDate: dayKey,
+          type,
+          lottery,
+          amounts,
+          updatedAt: Date.now()
+        }, { merge: true });
+      });
+      write(transaction);
+    });
+  };
   const addToCart = () => {
     if (!number || !quantity) {
       toast.error('Ingrese número y cantidad');
@@ -5039,8 +5110,8 @@ function App() {
     } else {
       // For PL, quantity is units, plAmount is price per unit
       const costPerUnit = parseFloat(plAmount);
-      if (!validateComboUnitCost('PL', costPerUnit)) return;
       calculatedAmount = qInt * costPerUnit;
+      if (!validateComboUnitCost('PL', calculatedAmount, costPerUnit)) return;
     }
 
     for (const lot of lotteriesToBuy) {
@@ -5100,6 +5171,7 @@ function App() {
     const target = cart[index];
     if (target && target.type === 'BL') {
       const others = cart.filter((_, i) => i !== index);
+      if (!validateComboUnitCost('BL', newAmount)) return;
       if (exceedsComboLimit('BL', target.number, target.lottery, newAmount, others)) return;
     }
     setCart(prev => prev.map((item, i) => i === index ? { ...item, amount: newAmount } : item));
@@ -5112,7 +5184,7 @@ function App() {
   };
 
   const getDailySequence = () => {
-    const now = new Date();
+    const now = serverNow();
     const startOfDay = new Date(now);
     // Reset at 1 AM
     if (now.getHours() < 1) {
@@ -5164,38 +5236,56 @@ function App() {
       }
     }
 
+    const abortSale = (message: string) => {
+      toast.error(message);
+      saleInFlightRef.current = false;
+      setIsSubmittingSale(false);
+      setShowCheckoutModal(false);
+    };
+
+    // La hora de cierre se valida con el reloj del servidor, no con el del dispositivo
+    if (!await syncServerClock()) {
+      abortSale('No se pudo verificar la hora del servidor. Revise su conexión e intente de nuevo.');
+      return;
+    }
+
     // Verify if any lottery in the cart is closed or has results
-    const now = new Date();
-    const todayStr = format(now, 'yyyy-MM-dd');
+    const todayStr = format(getBusinessDate(serverNow()), 'yyyy-MM-dd');
     for (const bet of unifiedCart) {
       const lot = lotteries.find(l => cleanText(l.name) === cleanText(bet.lottery));
       if (!lot) {
-        toast.error(`Sorteo no encontrado: ${bet.lottery}`);
+        abortSale(`Sorteo no encontrado: ${bet.lottery}`);
         return;
       }
       if (!isLotteryOpenForSales(lot)) {
-        toast.error(`El sorteo ${bet.lottery} ya está cerrado.`);
+        abortSale(`El sorteo ${bet.lottery} ya está cerrado.`);
+        return;
+      }
+      if (bet.type === 'BL' && !isBilleteOpenForSales(lot)) {
+        abortSale(`Los billetes de ${bet.lottery} ya cerraron.`);
         return;
       }
       const hasResult = results.some(r => cleanText(r.lotteryName) === cleanText(bet.lottery) && r.date === todayStr);
       if (hasResult) {
-        toast.error(`El sorteo ${bet.lottery} ya tiene resultados.`);
+        abortSale(`El sorteo ${bet.lottery} ya tiene resultados.`);
         return;
       }
     }
 
     try {
       if (editingTicketId) {
-        // Update existing ticket
-        await updateDoc(doc(db, 'tickets', editingTicketId), {
-          bets: unifiedCart,
-          totalAmount,
-          chancePrice,
-          customerName: finalCustomerName,
-          lastEditedAt: serverTimestamp()
-        });
-        
         const originalTicket = tickets.find(t => t.id === editingTicketId) || historyTickets.find(t => t.id === editingTicketId);
+
+        // Update existing ticket
+        await commitWithComboCounters(unifiedCart, originalTicket?.bets || [], (transaction) => {
+          transaction.update(doc(db, 'tickets', editingTicketId), {
+            bets: unifiedCart,
+            totalAmount,
+            chancePrice,
+            customerName: finalCustomerName,
+            lastEditedAt: serverTimestamp()
+          });
+        });
         
         const updatedTicket: LotteryTicket = {
           ...originalTicket!,
@@ -5215,22 +5305,26 @@ function App() {
       } else {
         // Create new ticket
         const sequenceNumber = getDailySequence();
-        const docRef = await addDoc(collection(db, 'tickets'), {
-          bets: unifiedCart,
-          totalAmount,
-          chancePrice,
-          timestamp: serverTimestamp(),
-          date: format(getBusinessDate(), 'yyyy-MM-dd'),
-          sellerId: user.uid,
-          sellerCode: userProfile?.sellerId || '---',
-          sellerEmail: currentSellerEmail,
-          sellerName: userProfile?.name || user.displayName || 'Vendedor',
-          commissionRate: userProfile?.commissionRate || 0,
-          status: 'active',
-          customerName: finalCustomerName,
-          sequenceNumber,
-          liquidated: false
+        const ticketRef = doc(collection(db, 'tickets'));
+        await commitWithComboCounters(unifiedCart, [], (transaction) => {
+          transaction.set(ticketRef, {
+            bets: unifiedCart,
+            totalAmount,
+            chancePrice,
+            timestamp: serverTimestamp(),
+            date: format(getBusinessDate(), 'yyyy-MM-dd'),
+            sellerId: user.uid,
+            sellerCode: userProfile?.sellerId || '---',
+            sellerEmail: currentSellerEmail,
+            sellerName: userProfile?.name || user.displayName || 'Vendedor',
+            commissionRate: userProfile?.commissionRate || 0,
+            status: 'active',
+            customerName: finalCustomerName,
+            sequenceNumber,
+            liquidated: false
+          });
         });
+        const docRef = ticketRef;
         
         const newTicket: LotteryTicket = {
           id: docRef.id,
@@ -5256,7 +5350,12 @@ function App() {
         toast.success('¡Venta realizada con éxito!');
       }
     } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, 'tickets');
+      if (error instanceof Error && error.message.startsWith('COMBO_LIMIT:')) {
+        setShowCheckoutModal(false);
+        toast.error(error.message.slice('COMBO_LIMIT:'.length));
+      } else {
+        handleFirestoreError(error, OperationType.WRITE, 'tickets');
+      }
     } finally {
       saleInFlightRef.current = false;
       setIsSubmittingSale(false);
@@ -5268,7 +5367,7 @@ function App() {
     if (!lot.closingTime) return true;
     
     try {
-      const now = new Date();
+      const now = serverNow();
       let currentHour = now.getHours();
       const currentMinutes = now.getMinutes();
       
@@ -5306,9 +5405,9 @@ function App() {
     if (!ticket.timestamp) return true;
     const ticketDate = ticket.timestamp?.toDate 
       ? ticket.timestamp.toDate() 
-      : (ticket.timestamp ? new Date(ticket.timestamp) : new Date());
+      : (ticket.timestamp ? new Date(ticket.timestamp) : serverNow());
     if (isNaN(ticketDate.getTime())) return true; // Treat invalid dates as closed
-    const now = new Date();
+    const now = serverNow();
     
     // Definir el "día del sorteo" (que empieza a la 1 AM)
     const getLotteryDay = (date: Date) => {
@@ -5839,7 +5938,9 @@ function App() {
       message: '¿Está seguro de borrar esta venta? Se eliminará permanentemente de la base de datos.',
       onConfirm: async () => {
         try {
-          await deleteDoc(doc(db, 'tickets', id));
+          await commitWithComboCounters([], ticket.bets || [], (transaction) => {
+            transaction.delete(doc(db, 'tickets', id));
+          });
           toast.success('Venta eliminada correctamente');
         } catch (error) {
           handleFirestoreError(error, OperationType.DELETE, `tickets/${id}`);
@@ -10429,81 +10530,80 @@ Diferencia: ${signedCurrency(difference)}`,
                 className="space-y-8"
               >
                 {configTabsBar}
-                <div className="glass-card p-4 sm:p-6 md:p-10">
-                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-6 mb-10">
-                    <div>
-                      <h2 className="text-2xl font-black italic tracking-tighter neon-text uppercase">ADMINISTRACIÓN</h2>
-                      <p className="text-xs font-mono text-muted-foreground mt-1 uppercase tracking-widest">Gestión de Loterías y Parámetros</p>
+                <div className="glass-card p-3 sm:p-6 md:p-10">
+                  <div className="flex items-center justify-between gap-3 mb-4 sm:mb-8">
+                    <div className="min-w-0">
+                      <h2 className="text-lg sm:text-2xl font-black italic tracking-tighter neon-text uppercase">Sorteos</h2>
+                      <p className="text-[10px] sm:text-xs font-mono text-muted-foreground mt-0.5 uppercase tracking-widest">Gestión de sorteos</p>
                     </div>
-                    <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
-                      {(userProfile?.role === 'ceo' || userProfile?.role === 'programador') && (
-                        <>
-                          <button 
-                            onClick={() => {
-                              setEditingLottery(null);
-                              setShowLotteryModal(true);
-                            }}
-                            className="flex-1 sm:flex-none bg-primary text-primary-foreground px-4 sm:px-6 py-3 rounded-xl font-extrabold uppercase text-xs tracking-widest flex items-center justify-center gap-2 hover:brightness-110 transition-all"
-                          >
-                            <Plus className="w-4 h-4" /> Nueva Lotería
-                          </button>
-                        </>
-                      )}
-                    </div>
+                    {(userProfile?.role === 'ceo' || userProfile?.role === 'programador') && (
+                      <button
+                        onClick={() => {
+                          setEditingLottery(null);
+                          setShowLotteryModal(true);
+                        }}
+                        className="shrink-0 bg-primary text-primary-foreground px-3 sm:px-6 py-2.5 sm:py-3 rounded-xl font-extrabold uppercase text-[11px] sm:text-xs tracking-wider flex items-center justify-center gap-1.5 hover:brightness-110 transition-all"
+                      >
+                        <Plus className="w-4 h-4" /> Nuevo
+                      </button>
+                    )}
                   </div>
-                  
-                  <div className="glass-card overflow-hidden">
-                    <div className="divide-y divide-white/5">
-                      {sortedLotteries.map(lot => (
-                        <div key={lot.id} className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 hover:bg-white/[0.02] transition-colors">
-                          <div className="flex items-center gap-4">
-                            <div className={`w-2 h-2 rounded-full shrink-0 ${lot.active ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]'}`} />
-                            <div>
-                              <p className="font-black uppercase tracking-tight text-sm">{cleanText(lot.name)}</p>
-                              <div className="flex flex-wrap items-center gap-2 mt-1">
-                                <div className="flex items-center gap-1 text-xs font-mono font-bold text-muted-foreground uppercase tracking-widest">
-                                  <TrendingUp className="w-3 h-3 text-primary" /> {lot.drawTime ? formatTime12h(lot.drawTime) : 'Sin horario'}
-                                </div>
-                                {lot.closingTime && (
-                                  <div className="flex items-center gap-1 text-xs font-mono font-bold bg-white/5 px-1.5 py-0.5 rounded text-red-400 border border-red-500/20">
-                                    <XCircle className="w-3 h-3" /> {formatTime12h(lot.closingTime)}
-                                  </div>
-                                )}
-                              </div>
+
+                  <div className="space-y-2">
+                    {sortedLotteries.map(lot => (
+                      <div key={lot.id} className="rounded-xl border border-white/10 bg-white/[0.03] p-3 space-y-2.5">
+                        <div className="flex items-start gap-2.5">
+                          <div className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${lot.active ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]'}`} />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-black uppercase tracking-tight text-sm leading-tight break-words">{cleanText(lot.name)}</p>
+                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-[11px] font-mono font-bold text-muted-foreground uppercase">
+                              <span className="flex items-center gap-1"><TrendingUp className="w-3 h-3 text-primary" /> {lot.drawTime ? formatTime12h(lot.drawTime) : 'Sin horario'}</span>
+                              {lot.closingTime && <span className="flex items-center gap-1 text-red-400"><XCircle className="w-3 h-3" /> {formatTime12h(lot.closingTime)}</span>}
+                            </div>
+                            <div className="flex flex-wrap gap-1 mt-1.5">
+                              {[
+                                `${lot.isFourDigits ? 4 : 2} cifras`,
+                                'Chance',
+                                lotteryAllowsPale(lot) && 'Palé',
+                                lotteryAllowsBillete(lot) && 'Billete'
+                              ].filter(Boolean).map(tag => (
+                                <span key={String(tag)} className="rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wide text-primary">{tag}</span>
+                              ))}
+                              {!lot.active && <span className="rounded-md bg-red-500/10 px-1.5 py-0.5 text-[10px] font-black uppercase text-red-400">Pausado</span>}
                             </div>
                           </div>
+                        </div>
                         {(userProfile?.role === 'ceo' || userProfile?.role === 'programador') && (
-                          <div className="flex items-center gap-2 w-full md:w-auto mt-4 md:mt-0">
-                            <button 
+                          <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
+                            <button
                               onClick={() => {
                                 setEditingLottery(lot);
                                 setShowLotteryModal(true);
                               }}
-                              className="flex-1 md:flex-none bg-white/5 hover:bg-white/10 px-4 py-3 rounded-lg text-xs font-extrabold uppercase tracking-widest transition-colors"
+                              className="bg-white/5 hover:bg-white/10 py-2.5 rounded-lg text-[11px] font-extrabold uppercase tracking-wider transition-colors"
                             >
                               Editar
                             </button>
-                            <button 
+                            <button
                               onClick={() => toggleLotteryActive(lot)}
-                              className={`flex-1 md:flex-none px-4 py-3 rounded-lg text-xs font-extrabold uppercase tracking-widest transition-colors ${
-                                lot.active 
-                                  ? 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-400' 
+                              className={`py-2.5 rounded-lg text-[11px] font-extrabold uppercase tracking-wider transition-colors ${
+                                lot.active
+                                  ? 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-400'
                                   : 'bg-green-500/10 hover:bg-green-500/20 text-green-400'
                               }`}
                             >
                               {lot.active ? 'Pausar' : 'Activar'}
                             </button>
-                            <button 
+                            <button
                               onClick={() => deleteLottery(lot.id)}
-                              className="p-3 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg shrink-0"
+                              className="px-3 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg flex items-center justify-center"
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
+                              <Trash2 className="w-4 h-4" />
                             </button>
                           </div>
                         )}
                       </div>
                     ))}
-                    </div>
                   </div>
                     
                     {lotteries.length === 0 && (userProfile?.role === 'ceo' || userProfile?.role === 'programador') && (
