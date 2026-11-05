@@ -127,6 +127,14 @@ interface Bet {
   price?: number;
 }
 
+const getBetTypeLabel = (type?: string) => {
+  const t = String(type || '').trim().toUpperCase();
+  if (t.startsWith('B')) return 'BL';
+  if (t.startsWith('P')) return 'PL';
+  if (t.startsWith('C')) return 'CH';
+  return t || '?';
+};
+
 const getBetUnitPrice = (bet: Bet) => (
   typeof bet.price === 'number' && bet.price > 0
     ? bet.price
@@ -1281,7 +1289,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
         const numStr = bet?.type === 'PL' && bet?.number?.length === 4
           ? `${bet.number.slice(0, 2)}-${bet.number.slice(2, 4)}`
           : (bet?.number || '??');
-        const desc = `${numStr} ${bet?.type || '?'} x${bet.quantity}`;
+        const desc = `${numStr} ${getBetTypeLabel(bet?.type)} x${bet.quantity}`;
 
         lines.push(receiptPairLine(desc, `$${(bet?.amount || 0).toFixed(2)}`, width));
         if (betTotalPrize > 0) {
@@ -1461,7 +1469,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
                                     : (bet?.number || '??')}
                                 </span>
                                 <span className="text-[9px] font-mono font-bold text-gray-400 uppercase">
-                                  {bet?.type || '?'}
+                                  {getBetTypeLabel(bet?.type)}
                                 </span>
                                 {hasWon && (
                                   <div className="flex flex-wrap gap-0.5 ml-1">
@@ -2920,6 +2928,57 @@ const cleanTextForExport = (text: unknown) => {
     .trim();
 };
 
+const toPdfSafeText = (value: string) => value
+  .normalize('NFC')
+  .replace(/[\u00B7\u2022\u2013\u2014]/g, '-')
+  .replace(/\u2192/g, '->')
+  .replace(/[\u2018\u2019]/g, "'")
+  .replace(/[\u201C\u201D]/g, '"')
+  .replace(/[^\u0020-\u007E\u00A0-\u00FF\n]/g, '')
+  .replace(/[ ]{2,}/g, ' ');
+
+// jsPDF con fuentes estándar solo soporta Latin-1; cualquier otro carácter sale como símbolos raros.
+const createReportPdf = () => {
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4' });
+  const originalText = pdf.text.bind(pdf) as (...args: any[]) => any;
+  (pdf as any).text = (text: any, ...rest: any[]) => originalText(
+    Array.isArray(text) ? text.map(t => toPdfSafeText(String(t))) : toPdfSafeText(String(text ?? '')),
+    ...rest
+  );
+  return pdf;
+};
+
+const sharePdfDocument = async (pdf: jsPDF, fileName: string, title: string, text: string): Promise<'shared' | 'cancelled' | 'downloaded'> => {
+  if (Capacitor.isNativePlatform()) {
+    try {
+      const savedFile = await Filesystem.writeFile({
+        path: fileName,
+        data: pdf.output('datauristring').split(',')[1],
+        directory: Directory.Cache
+      });
+      await Share.share({ title, text, files: [savedFile.uri], dialogTitle: 'Compartir PDF' });
+      return 'shared';
+    } catch (error: any) {
+      if (/cancel/i.test(String(error?.message || error))) return 'cancelled';
+      console.error('Error sharing PDF natively:', error);
+    }
+  } else if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+    try {
+      const file = new File([pdf.output('blob')], fileName, { type: 'application/pdf' });
+      const payload = { title, text, files: [file] };
+      if (!navigator.canShare || navigator.canShare(payload)) {
+        await navigator.share(payload);
+        return 'shared';
+      }
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return 'cancelled';
+      console.error('Error sharing PDF:', error);
+    }
+  }
+  pdf.save(fileName);
+  return 'downloaded';
+};
+
 const UserModal = ({ show, userProfile, onSave, onClose, currentUserRole, canCreateProgramador = false }: {
   show: boolean;
   userProfile: UserProfile | null;
@@ -3133,7 +3192,8 @@ const UserModal = ({ show, userProfile, onSave, onClose, currentUserRole, canCre
   );
 };
 
-const FastEntryModal = ({ show, onAdd, onClose, selectedLotteries, chancePrice, plAmount }: {
+const FastEntryModal = ({ show, onAdd, onClose, selectedLotteries, chancePrice, plAmount, comboType }: {
+  comboType: 'PL' | 'BL';
   show: boolean;
   onAdd: (bets: Bet[]) => void;
   onClose: () => void;
@@ -3181,7 +3241,7 @@ const FastEntryModal = ({ show, onAdd, onClose, selectedLotteries, chancePrice, 
         const quantity = parseInt(qtyStr, 10);
 
         if (quantity > 0 && numStr.length >= 1 && numStr.length <= 4) {
-          let type: 'CH' | 'PL' = 'CH';
+          let type: 'CH' | 'PL' | 'BL' = 'CH';
           let finalNumber = numStr;
           let calculatedAmount = 0;
 
@@ -3190,7 +3250,7 @@ const FastEntryModal = ({ show, onAdd, onClose, selectedLotteries, chancePrice, 
             finalNumber = numStr.padStart(2, '0');
             calculatedAmount = quantity * chancePrice;
           } else {
-            type = 'PL';
+            type = comboType;
             finalNumber = numStr.padStart(4, '0');
             calculatedAmount = quantity * plCostPerUnit;
           }
@@ -3938,37 +3998,8 @@ function App() {
     toast.info(`Nuevo día operativo iniciado: ${businessDayKey}`);
   }, [archiveDate, autoResetStateOnBusinessDayChange, businessDayKey, historyDate, liquidationDate, recoveryDate, user?.email, userProfile?.role]);
 
-  // Inactivity timeout logic
-  useEffect(() => {
-    if (!user) return;
-
-    let timeoutId: NodeJS.Timeout;
-    const timeoutMinutes = userProfile?.role === 'ceo' ? (userProfile.sessionTimeoutMinutes || 60) : 60;
-    const timeoutMs = timeoutMinutes * 60 * 1000;
-
-    const resetTimeout = () => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => {
-        handleLogout();
-        toast.error('Sesión cerrada por inactividad');
-      }, timeoutMs);
-    };
-
-    // Set initial timeout
-    resetTimeout();
-
-    // Listeners for user activity
-    const events = ['mousemove', 'keydown', 'mousedown', 'touchstart', 'scroll'];
-    events.forEach(event => window.addEventListener(event, resetTimeout));
-
-    return () => {
-      clearTimeout(timeoutId);
-      events.forEach(event => window.removeEventListener(event, resetTimeout));
-    };
-  }, [user, userProfile?.sessionTimeoutMinutes, userProfile?.role]);
-
-  useEffect(() => {
-    if (userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador') {
+    useEffect(() => {
+      if (userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador') {
       console.log("Fetching all users for role:", userProfile.role);
       const q = query(collection(db, 'users'));
       const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -5971,7 +6002,7 @@ function App() {
     if (betsToShare.length === 0) return;
 
     betsToShare.forEach((bet, idx) => {
-      message += `${idx + 1}. ${cleanText(bet.lottery)} - ${bet.type} ${bet.number} - $${bet.amount}\n`;
+      message += `${idx + 1}. ${cleanText(bet.lottery)} - ${getBetTypeLabel(bet.type)} ${bet.number} - $${bet.amount}\n`;
     });
     
     const totalAmount = betsToShare.reduce((sum, b) => sum + (b.amount || 0), 0);
@@ -7045,7 +7076,7 @@ Diferencia: ${signedCurrency(difference)}`,
         ))
         .sort((a, b) => cleanTextForExport(a.name).localeCompare(cleanTextForExport(b.name)));
 
-      const pdf = new jsPDF({ unit: 'mm', format: 'a4' });
+      const pdf = createReportPdf();
       const marginX = 12;
       const maxWidth = 186;
       const pageHeight = pdf.internal.pageSize.getHeight();
@@ -7133,8 +7164,15 @@ Diferencia: ${signedCurrency(difference)}`,
         separator();
       });
 
-      pdf.save(`${cleanTextForExport(`Reporte-Consolidado-${reportStartDate}-a-${reportEndDate}`)}.pdf`);
-      toast.success(`Reporte consolidado listo (${reportStartDate} -> ${reportEndDate})`, { id: toastId });
+      const consolidatedName = `${cleanTextForExport(`Reporte-Consolidado-${reportStartDate}-a-${reportEndDate}`)}.pdf`;
+      const consolidatedResult = await sharePdfDocument(pdf, consolidatedName, 'Reporte consolidado', `Reporte consolidado ${reportStartDate} a ${reportEndDate}`);
+      if (consolidatedResult === 'shared') {
+        toast.success('Reporte consolidado compartido', { id: toastId });
+      } else if (consolidatedResult === 'cancelled') {
+        toast.dismiss(toastId);
+      } else {
+        toast.info('Se descargó el PDF para compartirlo manualmente', { id: toastId });
+      }
     } catch (error) {
       console.error('Error generating consolidated report:', error);
       toast.error('No se pudo generar el reporte consolidado', { id: toastId });
@@ -7541,7 +7579,7 @@ Diferencia: ${signedCurrency(difference)}`,
         return;
       }
 
-      const pdf = new jsPDF({ unit: 'mm', format: 'a4' });
+      const pdf = createReportPdf();
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
       const margin = 14;
@@ -7656,29 +7694,15 @@ Diferencia: ${signedCurrency(difference)}`,
         }
       }
 
-      if (Capacitor.isNativePlatform()) {
-        try {
-          const pdfData = pdf.output('datauristring').split(',')[1];
-          const savedFile = await Filesystem.writeFile({
-            path: fileName,
-            data: pdfData,
-            directory: Directory.Cache
-          });
-          await Share.share({
-            title: `Reporte ${cleanText(lotteryName)}`,
-            text: `Reporte ${filterLabel} de ${cleanText(lotteryName)} para el día ${historyDate}`,
-            files: [savedFile.uri],
-            dialogTitle: 'Compartir reporte PDF'
-          });
-          toast.success('Reporte PDF compartido', { id: toastId });
-        } catch (shareError) {
-          console.error('Error sharing stats report PDF:', shareError);
-          pdf.save(fileName);
-          toast.info('No se pudo abrir el menú para compartir; se descargó el PDF', { id: toastId });
-        }
+      const pdfTitle = `Reporte ${cleanText(lotteryName)}`;
+      const pdfText = `Reporte ${filterLabel} de ${cleanText(lotteryName)} para el día ${historyDate}`;
+      const pdfResult = await sharePdfDocument(pdf, fileName, pdfTitle, pdfText);
+      if (pdfResult === 'shared') {
+        toast.success('Reporte PDF compartido', { id: toastId });
+      } else if (pdfResult === 'cancelled') {
+        toast.dismiss(toastId);
       } else {
-        pdf.save(fileName);
-        toast.success('Reporte PDF descargado', { id: toastId });
+        toast.info('Se descargó el PDF para compartirlo manualmente', { id: toastId });
       }
     } catch (error) {
       console.error('Error generating stats report:', error);
@@ -8760,7 +8784,11 @@ Diferencia: ${signedCurrency(difference)}`,
           const accepted: Bet[] = [];
           bets.forEach(b => {
             const working = [...cart, ...accepted];
-            if (b.type === 'PL' && exceedsComboLimit('PL', b.number, b.lottery, b.amount, working)) return;
+            if (b.type === 'BL') {
+              if (!lotteryAllowsBillete(findActiveLotteryByName(b.lottery)) || !isBilleteOpenForSales(findActiveLotteryByName(b.lottery))) return;
+              if (!validateComboUnitCost('BL', b.amount)) return;
+            }
+            if ((b.type === 'PL' || b.type === 'BL') && exceedsComboLimit(b.type, b.number, b.lottery, b.amount, working)) return;
             accepted.push(b);
           });
           if (accepted.length === 0) return;
@@ -8771,6 +8799,7 @@ Diferencia: ${signedCurrency(difference)}`,
         selectedLotteries={isMultipleMode ? multiLottery : (selectedLottery ? [selectedLottery] : [])}
         chancePrice={chancePrice}
         plAmount={plAmount}
+        comboType={betType === 'BL' ? 'BL' : 'PL'}
       />
 
       {showTicketModal && (
@@ -9428,7 +9457,7 @@ Diferencia: ${signedCurrency(difference)}`,
                             {betList.map((bet) => (
                               <div key={`${bet.lottery}-${bet.number}-${bet.type}-${bet.originalIdx}`} className="flex items-center justify-between text-xs bg-white/5 p-1.5 rounded-lg border border-white/5">
                                 <div className="flex items-center gap-2 overflow-hidden">
-                                  <span className="font-mono font-bold text-primary shrink-0">{bet.type}</span>
+                                  <span className="font-mono font-bold text-primary shrink-0">{getBetTypeLabel(bet.type)}</span>
                                   <span className="font-bold tracking-widest shrink-0">{bet.number}</span>
                                 </div>
                                 <div className="flex items-center gap-2 shrink-0">
