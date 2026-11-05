@@ -67,6 +67,9 @@ import {
   Menu,
   X,
   Edit2,
+  Receipt,
+  ToggleLeft,
+  ToggleRight,
   Copy,
   Users,
   Banknote,
@@ -99,6 +102,7 @@ import { Filesystem, Directory } from '@capacitor/filesystem';
 import * as htmlToImage from 'html-to-image';
 import { jsPDF } from 'jspdf';
 import QRCode from 'react-qr-code';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { toPng } from 'html-to-image';
 import { TicketReceiptExport } from './components/TicketReceiptExport';
 import { BottomNav } from './components/BottomNav';
@@ -901,7 +905,13 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
   const shareLotteryLabel = selectedLotteryName
     ? cleanText(selectedLotteryName)
     : Array.from(new Set((ticket.bets || []).map(b => cleanText(b.lottery)).filter(Boolean))).join(', ') || 'sorteos varios';
-  const shareTicketText = `Total USD ${localTotalAmount.toFixed(2)} - Sorteo: ${shareLotteryLabel}`;
+  const sharedLotteryCount = new Set((ticket.bets || [])
+    .filter(b => showFullTicket || !selectedLotteryName || normalizePlainText(b?.lottery || '') === normalizePlainText(selectedLotteryName))
+    .map(b => normalizePlainText(b?.lottery || ''))
+    .filter(Boolean)).size;
+  const shareTicketText = sharedLotteryCount > 1
+    ? `Ticket: ${ticket.id.slice(0, 8).toUpperCase()}\nTotal: $${localTotalAmount.toFixed(2)}`
+    : `Sorteo: ${shareLotteryLabel}\nTotal: $${localTotalAmount.toFixed(2)}`;
 
   const compartirTicket = async () => {
     const node = ticketRef.current;
@@ -954,18 +964,18 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
           });
           const fileUri = fileUriResult.uri;
 
-          // Prioritize attaching image file first; some targets drop files when text is included.
           try {
             await Share.share({
               title: 'Ticket de Juego',
+              text: shareTicketText,
               files: [fileUri],
               dialogTitle: 'Compartir Ticket'
             });
             shared = true;
-          } catch {
+          } catch (textShareErr) {
+            if (/cancel/i.test(String((textShareErr as any)?.message || textShareErr))) return;
             await Share.share({
               title: 'Ticket de Juego',
-              text: shareTicketText,
               files: [fileUri],
               dialogTitle: 'Compartir Ticket'
             });
@@ -985,6 +995,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
           if (navigator.canShare && navigator.canShare({ files: [file] })) {
             await navigator.share({
               title: 'Ticket de Juego',
+              text: shareTicketText,
               files: [file]
             });
             shared = true;
@@ -1014,35 +1025,53 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
     }
   };
 
-  const downloadTicket = async () => {
-    if (ticketRef.current === null) return;
+  const shareThermalImage = async () => {
     try {
-      const node = ticketRef.current;
-      const width = node.scrollWidth;
-      const height = node.scrollHeight;
-
-      const dataUrl = await toPng(node, { 
-        width,
-        height,
-        backgroundColor: '#ffffff',
-        cacheBust: true,
-        pixelRatio: 2,
-        style: {
-          transform: 'scale(1)',
-          transformOrigin: 'top left',
-          margin: '0',
-          left: '0',
-          top: '0'
-        }
+      const dateLabel = ticket.timestamp?.toDate
+        ? format(ticket.timestamp.toDate(), 'd/MM/yyyy HH:mm:ss')
+        : format(new Date(), 'd/MM/yyyy HH:mm:ss');
+      const txCode = ticket.id.slice(0, 8).toUpperCase();
+      const lotteryMap = new Map<string, string>();
+      (ticket.bets || []).forEach(bet => {
+        const rawLottery = (bet?.lottery || '').trim();
+        const lotteryKey = normalizePlainText(rawLottery);
+        if (lotteryKey && !lotteryMap.has(lotteryKey)) lotteryMap.set(lotteryKey, rawLottery);
       });
-      const link = document.createElement('a');
-      link.download = `ticket-${ticket.id.slice(0, 4)}.png`;
-      link.href = dataUrl;
-      link.click();
-      toast.success('Ticket descargado con éxito');
+      const sections = Array.from(lotteryMap.entries())
+        .filter(([lotteryKey]) => showFullTicket || !selectedLotteryName || lotteryKey === normalizePlainText(selectedLotteryName))
+        .map(([lotteryKey, lotName]) => {
+          const betsForLot = (ticket.bets || []).filter(b => normalizePlainText(b?.lottery || '') === lotteryKey);
+          const items = unifyBets(betsForLot.map(b => ({ ...b, lottery: lotName }))).map(bet => {
+            const qty = Number(bet.quantity) || 1;
+            if (bet.type === 'PL') {
+              const num = bet.number?.length === 4 ? `${bet.number.slice(0, 2)}-${bet.number.slice(2, 4)}` : (bet.number || '??');
+              return { prefix: 'PL ', number: num, suffix: qty > 1 ? ` x${qty}` : '' };
+            }
+            if (bet.type === 'BL') return { prefix: 'BL ', number: String(bet.number), suffix: qty > 1 ? ` x${qty}` : '' };
+            return { prefix: `${qty}x`, number: String(bet.number), suffix: '' };
+          });
+          return { title: cleanText(lotName), items };
+        });
+      const dataUrl = await renderShareReceiptPng({
+        qrValue: `ticket:${ticket.id}:${getTicketDate(ticket)}`,
+        headerLines: [
+          'CHANCE PRO - COMPROBANTE',
+          dateLabel,
+          `CLIENTE: ${(ticket.customerName || 'Cliente General').toUpperCase()}`,
+          `VENDEDOR: ${ticket.sellerCode || '---'}`,
+          `TX: ${txCode}`
+        ],
+        sections,
+        txCode,
+        prizeTotal: totalPrize,
+        total: localTotalAmount
+      });
+      const result = await shareImageFile(dataUrl, `ticket-${ticket.id.slice(0, 8)}.png`,       'Ticket de Juego', shareTicketText); {
+        toast.info('Se descargó la imagen del ticket para compartirla manualmente');
+      }
     } catch (err) {
       console.error(err);
-      toast.error('Error al descargar el ticket');
+      toast.error('No se pudo compartir el ticket');
     }
   };
 
@@ -1276,6 +1305,14 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
         lines.push(`1:${result.firstPrize} 2:${result.secondPrize} 3:${result.thirdPrize}`);
       }
 
+      let packed = '';
+      let packedLen = 0;
+      const winnerLines: string[] = [];
+      const flushPacked = () => {
+        if (packedLen > 0) lines.push(`${' '.repeat(Math.max(0, Math.floor((width - packedLen) / 2)))}${packed}`);
+        packed = '';
+        packedLen = 0;
+      };
       unifiedBetsForLot.forEach((bet) => {
         const originalMatches = (ticket.bets || [])
           .map((original, originalIdx) => ({ original, originalIdx }))
@@ -1289,13 +1326,19 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
         const numStr = bet?.type === 'PL' && bet?.number?.length === 4
           ? `${bet.number.slice(0, 2)}-${bet.number.slice(2, 4)}`
           : (bet?.number || '??');
-        const desc = `${numStr} ${getBetTypeLabel(bet?.type)} x${bet.quantity}`;
-
-        lines.push(receiptPairLine(desc, `$${(bet?.amount || 0).toFixed(2)}`, width));
-        if (betTotalPrize > 0) {
-          lines.push(boldReceiptText(`  PREMIA: $${betTotalPrize.toFixed(2)}`));
-        }
+        const qty = Number(bet.quantity) || 1;
+        const label = getBetTypeLabel(bet?.type);
+        const prefix = label === 'CH' ? `${qty}x` : label;
+        const suffix = label !== 'CH' && qty > 1 ? ` x${qty}` : '';
+        const itemLen = prefix.length + numStr.length + suffix.length;
+        const separatorLen = packedLen > 0 ? 3 : 0;
+        if (packedLen > 0 && packedLen + separatorLen + itemLen > width) flushPacked();
+        packed += `${packedLen > 0 ? ' | ' : ''}${prefix}${boldReceiptText(numStr)}${suffix}`;
+        packedLen += (packedLen > 0 ? 3 : 0) + itemLen;
+        if (betTotalPrize > 0) winnerLines.push(boldReceiptText(`  PREMIA ${numStr}: $${betTotalPrize.toFixed(2)}`));
       });
+      flushPacked();
+      winnerLines.forEach(winnerLine => lines.push(winnerLine));
       lines.push(line);
     });
 
@@ -1558,10 +1601,10 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
             <Printer className="w-4 h-4" /> Imprimir
           </button>
           <button 
-            onClick={() => downloadTicket()}
+            onClick={() => shareThermalImage()}
             className="flex items-center justify-center gap-2 bg-violet-600 text-white py-3 rounded-lg font-bold text-xs uppercase hover:bg-violet-700 transition-colors"
           >
-            <Download className="w-4 h-4" /> Imagen
+            <Share2 className="w-4 h-4" /> Share
           </button>
           <button 
             onClick={() => compartirTicket()}
@@ -2979,6 +3022,162 @@ const sharePdfDocument = async (pdf: jsPDF, fileName: string, title: string, tex
   return 'downloaded';
 };
 
+const renderShareReceiptPng = async (data: {
+  qrValue: string;
+  headerLines: string[];
+  sections: { title: string; items: { prefix: string; number: string; suffix: string }[] }[];
+  txCode: string;
+  prizeTotal: number;
+  total: number;
+}): Promise<string> => {
+  const font = '"Courier New", Courier, monospace';
+  const width = 440;
+  const pad = 22;
+  const lh = 26;
+  const qrSize = 112;
+  const rightX = width - pad;
+
+  const qrSvg = renderToStaticMarkup(<QRCode value={data.qrValue} size={qrSize} />);
+  const qrImage = await new Promise<HTMLImageElement | null>(resolve => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(qrSvg)}`;
+  });
+
+  type Part = { text: string; size: number; bold?: boolean };
+  type Row = { text: string; bold?: boolean; align?: 'left' | 'center'; right?: string; gap?: number; parts?: Part[]; height?: number };
+  const measureCtx = document.createElement('canvas').getContext('2d')!;
+  const partsWidth = (parts: Part[]) => parts.reduce((sum, part) => {
+    measureCtx.font = `${part.bold ? 'bold ' : ''}${part.size}px ${font}`;
+    return sum + measureCtx.measureText(part.text).width;
+  }, 0);
+  const rows: Row[] = [];
+  data.sections.forEach(section => {
+    rows.push({ text: section.title, bold: true, gap: 8 });
+    let current: Part[] = [];
+    let count = 0;
+    const flush = () => {
+      if (current.length) rows.push({ text: '', parts: current, height: 32 });
+      current = [];
+      count = 0;
+    };
+    section.items.forEach(item => {
+      const itemParts: Part[] = [
+        { text: item.prefix.trim(), size: 18 },
+        { text: item.number, size: 18, bold: true },
+        { text: `${item.suffix} | `, size: 18 }
+      ];
+      if (count > 0 && partsWidth(current) + partsWidth(itemParts) > width - 28) flush();
+      current.push(...itemParts);
+      count += 1;
+    });
+    flush();
+  });
+  rows.push({ text: `TX: ${data.txCode.toLowerCase()}`, bold: true, right: `$${data.total.toFixed(2)}`, gap: 8 });
+  rows.push({ text: '-'.repeat(32) });
+  if (data.prizeTotal > 0) rows.push({ text: 'PREMIO TOTAL', bold: true, right: `$${data.prizeTotal.toFixed(2)}` });
+  rows.push({ text: 'TOTAL', bold: true, right: `$${data.total.toFixed(2)}`, gap: 4 });
+  rows.push({ text: '-'.repeat(32) });
+  rows.push({ text: 'Sin comprobante no se pagan premios.', align: 'center', gap: 6 });
+  rows.push({ text: 'GRACIAS POR SU COMPRA', align: 'center' });
+
+  const headerHeight = Math.max(qrSize, data.headerLines.length * 20) + 14;
+  const bodyHeight = rows.reduce((sum, row) => sum + (row.height || lh) + (row.gap || 0), 0);
+  const height = pad + headerHeight + bodyHeight + pad;
+
+  const scale = 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = width * scale;
+  canvas.height = Math.ceil(height * scale);
+  const ctx = canvas.getContext('2d')!;
+  ctx.scale(scale, scale);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = '#000000';
+  ctx.textBaseline = 'middle';
+
+  if (qrImage) ctx.drawImage(qrImage, pad, pad, qrSize, qrSize);
+  const textX = pad + qrSize + 14;
+  data.headerLines.forEach((headerLine, index) => {
+    ctx.font = `bold 15px ${font}`;
+    let text = headerLine;
+    while (text.length > 1 && ctx.measureText(text).width > width - pad - textX) text = text.slice(0, -1);
+    ctx.fillText(text, textX, pad + 10 + index * 20);
+  });
+
+  let y = pad + headerHeight;
+  rows.forEach(row => {
+    y += row.gap || 0;
+    const rowHeight = row.height || lh;
+    if (row.parts) {
+      const trimmed = row.parts.slice();
+      const lastPart = trimmed[trimmed.length - 1];
+      trimmed[trimmed.length - 1] = { ...lastPart, text: lastPart.text.replace(/\s*\|\s*$/, '') };
+      let x = (width - partsWidth(trimmed)) / 2;
+      ctx.textAlign = 'left';
+      trimmed.forEach(part => {
+        ctx.font = `${part.bold ? 'bold ' : ''}${part.size}px ${font}`;
+        ctx.fillText(part.text, x, y + rowHeight / 2);
+        x += ctx.measureText(part.text).width;
+      });
+      y += rowHeight;
+      return;
+    }
+    ctx.font = `${row.bold ? 'bold ' : ''}18px ${font}`;
+    const centerY = y + lh / 2;
+    if (row.align === 'center') {
+      ctx.textAlign = 'center';
+      ctx.fillText(row.text, width / 2, centerY);
+    } else {
+      ctx.textAlign = 'left';
+      ctx.fillText(row.text, pad, centerY);
+    }
+    if (row.right) {
+      ctx.textAlign = 'right';
+      ctx.fillText(row.right, rightX, centerY);
+    }
+    ctx.textAlign = 'left';
+    y += lh;
+  });
+  return canvas.toDataURL('image/png');
+};
+
+const shareImageFile = async (dataUrl: string, fileName: string, title: string, text?: string): Promise<'shared' | 'cancelled' | 'downloaded'> => {
+  if (Capacitor.isNativePlatform()) {
+    try {
+      const savedFile = await Filesystem.writeFile({
+        path: fileName,
+        data: dataUrl.split(',')[1],
+        directory: Directory.Cache
+      });
+      await Share.share({ title, text, files: [savedFile.uri], dialogTitle: title });
+      return 'shared';
+    } catch (error: any) {
+      if (/cancel/i.test(String(error?.message || error))) return 'cancelled';
+      console.error('Error sharing image natively:', error);
+    }
+  } else if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      const file = new File([blob], fileName, { type: 'image/png' });
+      const payload = { title, text, files: [file] };
+      if (!navigator.canShare || navigator.canShare(payload)) {
+        await navigator.share(payload);
+        return 'shared';
+      }
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return 'cancelled';
+      console.error('Error sharing image:', error);
+    }
+  }
+  const link = document.createElement('a');
+  link.download = fileName;
+  link.href = dataUrl;
+  link.click();
+  return 'downloaded';
+};
+
 const UserModal = ({ show, userProfile, onSave, onClose, currentUserRole, canCreateProgramador = false }: {
   show: boolean;
   userProfile: UserProfile | null;
@@ -3836,7 +4035,7 @@ function App() {
     if (userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador') {
       setActiveTab('dashboard');
     } else {
-      setActiveTab('history');
+      setActiveTab('sales');
     }
   }, [userProfile?.role]);
 
@@ -3848,6 +4047,7 @@ function App() {
 
   const [historyFilter, setHistoryFilter] = useState<'TODO' | 'CHANCE' | 'BILLETE' | 'PALE'>('TODO');
   const [showTicketModal, setShowTicketModal] = useState<{ ticket: LotteryTicket, selectedLotteryName?: string } | null>(null);
+  const [numberTicketsModal, setNumberTicketsModal] = useState<{ lotteryName: string; type: 'CH' | 'PL' | 'BL'; number: string; rows: Array<{ ticket: LotteryTicket; amount: number; quantity: number }> } | null>(null);
   const [showTicketScanner, setShowTicketScanner] = useState(false);
   const [showLotteryModal, setShowLotteryModal] = useState<boolean>(false);
   const [editingResult, setEditingResult] = useState<LotteryResult | null>(null);
@@ -3890,6 +4090,7 @@ function App() {
   const selectableUsers = useMemo(() => {
     return users.filter(u => {
       if (!u || !u.email || u.status !== 'active') return false;
+      if (u.role === 'programador' && userProfile?.role !== 'programador') return false;
 
       const currentEmail = userProfile?.email?.toLowerCase();
       const targetEmail = u.email?.toLowerCase();
@@ -3908,9 +4109,6 @@ function App() {
 
   const [showUserModal, setShowUserModal] = useState(false);
   const [editingUser, setEditingUser] = useState<UserProfile | null>(null);
-  const [editingDebtUserEmail, setEditingDebtUserEmail] = useState<string>('');
-  const [editingDebtAmount, setEditingDebtAmount] = useState<string>('');
-  const [isSavingDebt, setIsSavingDebt] = useState(false);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [historySettlements, setHistorySettlements] = useState<Settlement[]>([]);
   const [historyResults, setHistoryResults] = useState<LotteryResult[]>([]);
@@ -3919,26 +4117,10 @@ function App() {
   const [liquidationSettlementsSnapshot, setLiquidationSettlementsSnapshot] = useState<Settlement[]>([]);
   const [isLiquidationDataLoading, setIsLiquidationDataLoading] = useState(false);
   const [selectedUserToLiquidate, setSelectedUserToLiquidate] = useState<string>('__ALL__');
-  const [selectedManageUserEmail, setSelectedManageUserEmail] = useState<string>('');
   const [liquidationDate, setLiquidationDate] = useState<string>(format(getBusinessDate(), 'yyyy-MM-dd'));
-  const [amountPaid, setAmountPaid] = useState<string>('');
-  const [isGeneratingYesterdayReport, setIsGeneratingYesterdayReport] = useState(false);
-  const [consolidatedMode, setConsolidatedMode] = useState<'day' | 'range'>('day');
-  const [consolidatedReportDate, setConsolidatedReportDate] = useState<string>(() => {
-    const d = getBusinessDate();
-    d.setDate(d.getDate() - 1);
-    return format(d, 'yyyy-MM-dd');
-  });
-  const [consolidatedStartDate, setConsolidatedStartDate] = useState<string>(() => {
-    const d = getBusinessDate();
-    d.setDate(d.getDate() - 1);
-    return format(d, 'yyyy-MM-dd');
-  });
-  const [consolidatedEndDate, setConsolidatedEndDate] = useState<string>(() => {
-    const d = getBusinessDate();
-    d.setDate(d.getDate() - 1);
-    return format(d, 'yyyy-MM-dd');
-  });
+  const [liquidationEndDate, setLiquidationEndDate] = useState<string>('');
+  const [isSharingLiquidation, setIsSharingLiquidation] = useState(false);
+  const liquidationDayCacheRef = useRef<Map<string, { tickets: LotteryTicket[]; results: LotteryResult[] }>>(new Map());
   const primaryCeoEmail = (import.meta.env.VITE_CEO_EMAIL || 'zsayeth09@gmail.com').toLowerCase();
   const isPrimaryCeoUser = (userProfile?.email || '').toLowerCase() === primaryCeoEmail;
   const historyDataCacheRef = useRef<Map<string, {
@@ -3982,7 +4164,7 @@ function App() {
     setHistoryResults([]);
     setLiquidationTicketsSnapshot([]);
     setLiquidationResultsSnapshot([]);
-    historyDataCacheRef.current.clear();
+    historyDataCacheRef.current.clear();liquidationDayCacheRef.current.clear();
     closedLotteryCardsCacheRef.current.clear();
 
     if (historyDate === previousBusinessDay) setHistoryDate(businessDayKey);
@@ -4140,6 +4322,45 @@ function App() {
     else setPlAmount('1.00');
     setFocusedField('number');
   };
+
+  // Vista de escritorio: portátil o tableta en horizontal. No afecta móvil ni vertical.
+  const [isDesktopLayout, setIsDesktopLayout] = useState(() => window.matchMedia('(min-width: 1024px) and (orientation: landscape)').matches);
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 1024px) and (orientation: landscape)');
+    const update = () => setIsDesktopLayout(media.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+
+  // Teclado físico en Ventas (solo escritorio): dígitos, punto, Retroceso/Supr y Enter para agregar.
+  const physicalKeyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  physicalKeyHandlerRef.current = (event: KeyboardEvent) => {
+    if (!isDesktopLayout || activeTab !== 'sales') return;
+    if (showCheckoutModal || showFastEntryModal || showTicketModal || numberTicketsModal || showTicketScanner || showUserModal || showMultiSelect || confirmModal) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest('input, textarea, select, [contenteditable="true"]')) return;
+
+    if (/^\d$/.test(event.key)) {
+      event.preventDefault();
+      handleKeyPress(event.key);
+    } else if (event.key === '.' || event.key === ',') {
+      event.preventDefault();
+      handleKeyPress('.');
+    } else if (event.key === 'Backspace' || event.key === 'Delete') {
+      event.preventDefault();
+      handleBackspace();
+    } else if (event.key === 'Enter' && number) {
+      event.preventDefault();
+      addToCart();
+    }
+  };
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => physicalKeyHandlerRef.current(event);
+    window.addEventListener('keydown', listener);
+    return () => window.removeEventListener('keydown', listener);
+  }, []);
 
   const NumericKeyboard = ({ onKeyPress, onBackspace, onClear }: { 
     onKeyPress: (key: string) => void; 
@@ -4549,13 +4770,32 @@ function App() {
     })();
   }, [getQuickOperationalDate, runOperationalArchiveAndCleanup, user?.uid, userProfile?.role, tick]);
 
+  // Con la app oculta más de 3 minutos se cierran las escuchas en tiempo real (cada ticket nuevo cuesta una lectura por escucha abierta).
+  const [isPageActive, setIsPageActive] = useState(true);
+  useEffect(() => {
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        hideTimer = setTimeout(() => setIsPageActive(false), 3 * 60 * 1000);
+      } else {
+        if (hideTimer) clearTimeout(hideTimer);
+        setIsPageActive(true);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
+
   const needsRealtimeOperationalData = useMemo(() => {
-    if (!userProfile?.role) return false;
-    if (activeTab === 'sales' || activeTab === 'dashboard' || activeTab === 'users' || activeTab === 'liquidaciones') return true;
+    if (!userProfile?.role || !isPageActive) return false;
+    if (activeTab === 'sales' || activeTab === 'dashboard' || activeTab === 'liquidaciones') return true;
     if ((activeTab === 'history' || activeTab === 'stats' || activeTab === 'cierres') && historyDate === businessDayKey) return true;
     if (activeTab === 'archivo' && archiveDate === businessDayKey) return true;
     return false;
-  }, [activeTab, archiveDate, businessDayKey, historyDate, userProfile?.role]);
+  }, [activeTab, archiveDate, businessDayKey, historyDate, isPageActive, userProfile?.role]);
 
   // 1. Static/Global Data
   useEffect(() => {
@@ -4566,7 +4806,7 @@ function App() {
     const unsubscribeLotteries = onSnapshot(qLot, async (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Lottery));
       setLotteries(docs);
-      historyDataCacheRef.current.clear();
+      historyDataCacheRef.current.clear();liquidationDayCacheRef.current.clear();
       
       // Use sorted lotteries to pick the first active one by time
       if (docs.length > 0 && !selectedLottery) {
@@ -4591,7 +4831,7 @@ function App() {
         console.log("Global settings fetched successfully");
         const data = snapshot.id ? { id: snapshot.id, ...snapshot.data() } as GlobalSettings : snapshot.data() as GlobalSettings;
         setGlobalSettings(data);
-        historyDataCacheRef.current.clear();
+        historyDataCacheRef.current.clear();liquidationDayCacheRef.current.clear();
       } else {
         console.warn("Global settings document not found");
         // If CEO is logged in and settings are missing, initialize them
@@ -4682,8 +4922,8 @@ function App() {
       console.log("Fetching settlements for user:", user?.email?.toLowerCase());
       const qSettlements = query(
         collection(db, 'settlements'),
-        orderBy('timestamp', 'desc'),
-        limit(120)
+        where('date', '==', businessDayKey),
+        limit(50)
       );
       const unsubscribeSettlements = onSnapshot(qSettlements, (snapshot) => {
         console.log("Settlements fetched successfully:", snapshot.size);
@@ -4724,7 +4964,8 @@ function App() {
     const qSettlements = query(
       collection(db, 'settlements'),
       where('userEmail', '==', user?.email?.toLowerCase()),
-      limit(50)
+      where('date', '==', businessDayKey),
+      limit(20)
     );
     const unsubscribeSettlements = onSnapshot(qSettlements, (snapshot) => {
       console.log("Settlements fetched successfully:", snapshot.size);
@@ -5934,15 +6175,15 @@ function App() {
   useEffect(() => {
     if (betType === 'BL') {
       const supportsBL = isMultipleMode 
-        ? multiLottery.some(name => lotteryAllowsBillete(findActiveLotteryByName(name)))
-        : lotteryAllowsBillete(findActiveLotteryByName(selectedLottery));
+        ? multiLottery.some(name => { const l = findActiveLotteryByName(name); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); })
+        : (() => { const l = findActiveLotteryByName(selectedLottery); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); })();
       
       if (!supportsBL) {
         setBetType('CH');
         setNumber('');
       }
     }
-  }, [betType, findActiveLotteryByName, isMultipleMode, multiLottery, selectedLottery]);
+  }, [betType, findActiveLotteryByName, isMultipleMode, multiLottery, selectedLottery, tick]);
 
   const cancelTicket = async (id: string) => {
     const ticket = tickets.find(t => t.id === id);
@@ -6604,580 +6845,251 @@ function App() {
   const selectedLiquidationIsAll = selectedUserToLiquidate === allLiquidationUsersValue;
   const signedCurrency = (value: number) => `${value > 0 ? '+' : value < 0 ? '-' : ''}USD ${Math.abs(value || 0).toFixed(2)}`;
   const signedAmountClass = (value: number) => value > 0 ? 'text-emerald-400' : value < 0 ? 'text-red-400' : 'text-muted-foreground';
-  const canManageMoneyAdjustments = !!userProfile && ['ceo', 'admin', 'programador'].includes(userProfile.role);
 
-  const saveUserDebt = async (targetUser: UserProfile) => {
-    if (!canManageMoneyAdjustments || !targetUser?.email) return;
-    const nextDebt = Number(editingDebtAmount);
-    if (Number.isNaN(nextDebt)) {
-      toast.error('Ingrese una deuda válida');
-      return;
-    }
+  const liquidationScopeEmail = canChooseLiquidationUser
+    ? selectedUserToLiquidate
+    : (userProfile?.email || '').toLowerCase();
+  const liquidationEnd = liquidationEndDate && liquidationEndDate > liquidationDate ? liquidationEndDate : liquidationDate;
+  const liquidationDateLabel = liquidationEnd === liquidationDate ? liquidationDate : `${liquidationDate} al ${liquidationEnd}`;
 
-    setIsSavingDebt(true);
-    try {
-      await updateDoc(doc(db, 'users', targetUser.email.toLowerCase()), {
-        currentDebt: nextDebt
+  const liquidationReport = useMemo(() => {
+    if (activeTab !== 'liquidaciones') return null;
+    const includeToday = liquidationDate <= businessDayKey && businessDayKey <= liquidationEnd;
+    const sourceTickets = [...(includeToday ? tickets : []), ...liquidationTicketsSnapshot];
+    const sourceResults = [...(includeToday ? results : []), ...liquidationResultsSnapshot];
+    const scopeAll = liquidationScopeEmail === allLiquidationUsersValue;
+    const round = (value: number) => Number(value.toFixed(2));
+
+    type LiquidationDrawRow = { key: string; name: string; time: string; sales: number; prizes: number; commission: number; utility: number };
+    type LiquidationUserRow = { key: string; label: string; sales: number; prizes: number; commission: number; utility: number; draws: Map<string, LiquidationDrawRow> };
+    const userRows = new Map<string, LiquidationUserRow>();
+    const globalDraws = new Map<string, LiquidationDrawRow>();
+    const addToDraw = (map: Map<string, LiquidationDrawRow>, key: string, name: string, sales: number, prizes: number, commission: number) => {
+      const row = map.get(key) ?? {
+        key,
+        name,
+        time: (() => {
+          const lot = lotteries.find(l => cleanText(l.name) === key);
+          return lot?.drawTime ? formatTime12h(lot.drawTime) : '';
+        })(),
+        sales: 0,
+        prizes: 0,
+        commission: 0,
+        utility: 0
+      };
+      row.sales += sales;
+      row.prizes += prizes;
+      row.commission += commission;
+      row.utility += sales - prizes - commission;
+      map.set(key, row);
+    };
+
+    sourceTickets.forEach(ticket => {
+      if (!ticket || ticket.status === 'cancelled') return;
+      const email = (ticket.sellerEmail || '').toLowerCase();
+      if (!scopeAll && email !== liquidationScopeEmail.toLowerCase()) return;
+
+      const userKey = email || String(ticket.sellerId || ticket.sellerName || 'sin-usuario').toLowerCase();
+      const profile = users.find(u => (u.email || '').toLowerCase() === email);
+      const userRow = userRows.get(userKey) ?? {
+        key: userKey,
+        label: getUserLabel({ email: email || profile?.email, name: profile?.name || ticket.sellerName }) || 'Usuario',
+        sales: 0,
+        prizes: 0,
+        commission: 0,
+        utility: 0,
+        draws: new Map<string, LiquidationDrawRow>()
+      };
+      const rate = (ticket.commissionRate || 0) / 100;
+      const lotteryNames = Array.from(new Set((ticket.bets || []).map(bet => bet?.lottery).filter(Boolean)));
+      lotteryNames.forEach(lotteryName => {
+        const drawKey = cleanText(lotteryName);
+        const sales = (ticket.bets || [])
+          .filter(bet => bet && cleanText(bet.lottery) === drawKey)
+          .reduce((sum, bet) => sum + (bet.amount || 0), 0);
+        const prizes = getTicketPrizesFromSource(ticket, sourceResults, lotteryName).totalPrize || 0;
+        const commission = sales * rate;
+        userRow.sales += sales;
+        userRow.prizes += prizes;
+        userRow.commission += commission;
+        userRow.utility += sales - prizes - commission;
+        addToDraw(userRow.draws, drawKey, drawKey, sales, prizes, commission);
+        addToDraw(globalDraws, drawKey, drawKey, sales, prizes, commission);
       });
-      setUsers(prev => prev.map(item => (
-        item.email?.toLowerCase() === targetUser.email.toLowerCase()
-          ? { ...item, currentDebt: nextDebt }
-          : item
-      )));
-      if (userProfile?.email?.toLowerCase() === targetUser.email.toLowerCase()) {
-        setUserProfile({ ...userProfile, currentDebt: nextDebt });
-      }
-      setEditingDebtUserEmail('');
-      setEditingDebtAmount('');
-      toast.success('Deuda actualizada');
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `users/${targetUser.email}`);
-    } finally {
-      setIsSavingDebt(false);
-    }
-  };
-
-  const selectedLiquidationSettlement = useMemo(() => {
-    if (!selectedUserToLiquidate || selectedUserToLiquidate === allLiquidationUsersValue || !liquidationDate) return null;
-    const sourceSettlements = liquidationDate === businessDayKey ? settlements : liquidationSettlementsSnapshot;
-    const matches = sourceSettlements.filter(settlement =>
-      (settlement.userEmail || '').toLowerCase() === selectedUserToLiquidate.toLowerCase() &&
-      settlement.date === liquidationDate
-    );
-    if (matches.length === 0) return null;
-    return matches.sort((a, b) => {
-      const aTime = a.timestamp?.toDate?.()?.getTime?.() ?? (a.timestamp?.seconds ? a.timestamp.seconds * 1000 : 0);
-      const bTime = b.timestamp?.toDate?.()?.getTime?.() ?? (b.timestamp?.seconds ? b.timestamp.seconds * 1000 : 0);
-      return bTime - aTime;
-    })[0];
-  }, [businessDayKey, liquidationDate, liquidationSettlementsSnapshot, selectedUserToLiquidate, settlements]);
-
-  useEffect(() => {
-    if (!selectedUserToLiquidate || selectedUserToLiquidate === allLiquidationUsersValue || !liquidationDate) {
-      setAmountPaid('');
-      return;
-    }
-    if (selectedLiquidationSettlement) {
-      setAmountPaid(String(selectedLiquidationSettlement.amountPaid ?? 0));
-      return;
-    }
-    setAmountPaid('');
-  }, [liquidationDate, selectedLiquidationSettlement?.amountPaid, selectedLiquidationSettlement?.id, selectedUserToLiquidate]);
-
-  const handleLiquidate = async () => {
-    if (!selectedUserToLiquidate || selectedLiquidationIsAll) return;
-    if (!canConfirmLiquidation) {
-      alert('No tienes permisos para liquidar');
-      return;
-    }
-    if (liquidationDate !== businessDayKey && isLiquidationDataLoading) {
-      toast.error('Espera a que termine la carga de datos históricos');
-      return;
-    }
-
-    const userToLiquidate = users.find(u => u.email === selectedUserToLiquidate);
-    if (!userToLiquidate) return;
-
-    const isCurrentOperationalDate = liquidationDate === businessDayKey;
-    const liquidationTicketsSource = isCurrentOperationalDate ? tickets : liquidationTicketsSnapshot;
-    const liquidationResultsSource = isCurrentOperationalDate ? results : liquidationResultsSnapshot;
-    const prizeResolver = (ticket: LotteryTicket) => getTicketPrizesFromSource(ticket, liquidationResultsSource);
-
-    const financialSummary = buildFinancialSummary({
-      tickets: liquidationTicketsSource,
-      userEmail: selectedUserToLiquidate,
-      targetDate: liquidationDate,
-      prizeResolver
+      userRows.set(userKey, userRow);
     });
 
-    const ticketsToLiquidate = financialSummary.tickets.filter(ticket =>
-      ticket.status !== 'cancelled' && !ticket.settlementId && !ticket.liquidated
-    );
-
-    const totalSales = financialSummary.totalSales;
-    const totalCommissions = financialSummary.totalCommissions;
-    const totalPrizes = financialSummary.totalPrizes;
-    const resultadoDia = totalSales - totalCommissions - totalPrizes;
-    const balanceFinal = resultadoDia;
-
-    const paid = Number(amountPaid) || 0;
-    const currentDebt = userToLiquidate.currentDebt || 0;
-    const existingDebtImpact = selectedLiquidationSettlement?.difference ?? selectedLiquidationSettlement?.debtAdded ?? 0;
-    const previousDebt = currentDebt - existingDebtImpact;
-    const difference = balanceFinal - paid;
-    const newTotalDebt = previousDebt + difference;
-    const actionLabel = selectedLiquidationSettlement ? 'actualizar' : 'liquidar';
-
-    setConfirmModal({
-      show: true,
-      title: selectedLiquidationSettlement ? 'Actualizar Liquidación' : 'Confirmar Liquidación Diaria',
-      message: `¿Está seguro de ${actionLabel} a ${getUserLabel(userToLiquidate)} para el día ${liquidationDate}? \
-\
-Resultado: ${signedCurrency(resultadoDia)}\
-Balance final: ${signedCurrency(balanceFinal)}\
-Monto recibido: USD ${paid.toFixed(2)}\
-Diferencia: ${signedCurrency(difference)}`,
-      onConfirm: async () => {
-        try {
-          const normalizedUserEmail = userToLiquidate.email.toLowerCase();
-          let existingSettlement = selectedLiquidationSettlement;
-
-          if (!existingSettlement) {
-            const settlementQueryByLower = await getDocs(query(
-              collection(db, 'settlements'),
-              where('userEmail', '==', normalizedUserEmail),
-              where('date', '==', liquidationDate),
-              limit(5)
-            ));
-            const lowerMatches = settlementQueryByLower.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as Settlement));
-            if (lowerMatches.length > 1) {
-              console.warn('Se encontraron múltiples settlements para el mismo usuario+fecha. Se actualizará el más reciente.', lowerMatches.map(item => item.id));
-            }
-            existingSettlement = lowerMatches.sort((a, b) => {
-              const aTime = a.timestamp?.toDate?.()?.getTime?.() ?? (a.timestamp?.seconds ? a.timestamp.seconds * 1000 : 0);
-              const bTime = b.timestamp?.toDate?.()?.getTime?.() ?? (b.timestamp?.seconds ? b.timestamp.seconds * 1000 : 0);
-              return bTime - aTime;
-            })[0] || null;
-          }
-
-          const currentDebtValue = userToLiquidate.currentDebt || 0;
-          const baselineDebt = currentDebtValue - (existingSettlement?.difference ?? existingSettlement?.debtAdded ?? 0);
-          const finalDifference = balanceFinal - paid;
-          const finalNewTotalDebt = baselineDebt + finalDifference;
-
-          const settlementPayload = {
-            userEmail: normalizedUserEmail,
-            sellerEmail: normalizedUserEmail,
-            sellerId: userToLiquidate.sellerId || null,
-            date: liquidationDate,
-            totalSales,
-            totalCommissions,
-            totalPrizes,
-            resultadoDia,
-            balanceFinal,
-            netProfit: resultadoDia,
-            net: resultadoDia,
-            amountPaid: paid,
-            difference: finalDifference,
-            debtAdded: finalDifference,
-            previousDebt: baselineDebt,
-            newTotalDebt: finalNewTotalDebt,
-            liquidatedBy: userProfile?.email,
-            updatedAt: serverTimestamp()
-          };
-
-          let settlementId = existingSettlement?.id || '';
-          if (existingSettlement) {
-            await updateDoc(doc(db, 'settlements', existingSettlement.id), settlementPayload);
-          } else {
-            const settlementRef = await addDoc(collection(db, 'settlements'), {
-              ...settlementPayload,
-              timestamp: serverTimestamp()
-            });
-            settlementId = settlementRef.id;
-          }
-
-          const effectiveSettlementId = settlementId || existingSettlement?.id || '';
-          console.log('Settlement guardado:', effectiveSettlementId);
-          console.log('Tickets a liquidar (solo día actual):', ticketsToLiquidate.length);
-
-          const userRef = doc(db, 'users', userToLiquidate.email);
-          await updateDoc(userRef, { currentDebt: finalNewTotalDebt });
-
-          const secondaryWarnings: string[] = [];
-
-          if (isCurrentOperationalDate && effectiveSettlementId) {
-            if (ticketsToLiquidate.length > 0) {
-              try {
-                for (let i = 0; i < ticketsToLiquidate.length; i += 450) {
-                  const chunk = ticketsToLiquidate.slice(i, i + 450);
-                  const batch = writeBatch(db);
-                  chunk.forEach(ticket => {
-                    if (ticket.status === 'cancelled') return;
-                    if (ticket.settlementId || ticket.liquidated) return;
-                    batch.update(doc(db, 'tickets', ticket.id), {
-                      liquidated: true,
-                      settlementId: effectiveSettlementId
-                    });
-                  });
-                  await batch.commit();
-                }
-              } catch (ticketUpdateError) {
-                console.error('Error actualizando tickets:', ticketUpdateError);
-                secondaryWarnings.push('tickets');
-              }
-            }
-          }
-
-          const liquidatedTicketIds = new Set(ticketsToLiquidate.map(ticket => ticket.id));
-
-          if (isCurrentOperationalDate && effectiveSettlementId) {
-            setTickets(prev => prev.map(ticket => (
-              liquidatedTicketIds.has(ticket.id)
-                ? { ...ticket, liquidated: true, settlementId: effectiveSettlementId }
-                : ticket
-            )));
-          }
-
-          setUsers(prev => prev.map(userItem => (
-            userItem.email === userToLiquidate.email
-              ? { ...userItem, currentDebt: finalNewTotalDebt }
-              : userItem
-          )));
-
-          const settlementStateItem: Settlement = {
-            id: effectiveSettlementId,
-            userEmail: normalizedUserEmail,
-            date: liquidationDate,
-            totalSales,
-            totalCommissions,
-            totalPrizes,
-            resultadoDia,
-            balanceFinal,
-            netProfit: resultadoDia,
-            amountPaid: paid,
-            difference: finalDifference,
-            debtAdded: finalDifference,
-            previousDebt: baselineDebt,
-            newTotalDebt: finalNewTotalDebt,
-            liquidatedBy: userProfile?.email || '',
-            timestamp: existingSettlement?.timestamp || (new Date() as any)
-          };
-
-          const upsertSettlement = (list: Settlement[]) => {
-            const idx = list.findIndex(item => item.id === settlementStateItem.id);
-            if (idx === -1) return [settlementStateItem, ...list];
-            const next = [...list];
-            next[idx] = settlementStateItem;
-            return next;
-          };
-
-          setSettlements(prev => upsertSettlement(prev));
-          if (!isCurrentOperationalDate) {
-            setLiquidationSettlementsSnapshot(prev => upsertSettlement(prev));
-          }
-
-          if (secondaryWarnings.length > 0 && isCurrentOperationalDate) {
-            toast.warning(`Liquidación guardada. Hubo incidencias secundarias en: ${secondaryWarnings.join(', ')}`);
-          } else {
-            toast.success(existingSettlement ? 'Liquidación actualizada correctamente' : 'Liquidación guardada correctamente');
-          }
-
-          setAmountPaid(String(paid));
-        } catch (error) {
-          console.error('ERROR LIQUIDACION:', error);
-          alert('Error al guardar la liquidación. Revisa conexión o permisos.');
-          handleFirestoreError(error, OperationType.WRITE, 'settlements');
-        }
-      }
+    const finish = <T extends { sales: number; prizes: number; commission: number; utility: number }>(row: T): T => ({
+      ...row,
+      sales: round(row.sales),
+      prizes: round(row.prizes),
+      commission: round(row.commission),
+      utility: round(row.utility)
     });
-  };
-  const generateConsolidatedReport = async () => {
-    if (!canConfirmLiquidation) {
-      toast.error('No tiene permisos para generar este reporte');
-      return;
-    }
+    const finishDraws = (map: Map<string, LiquidationDrawRow>) => Array.from(map.values())
+      .map(finish)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const usersList = Array.from(userRows.values())
+      .map(row => ({ ...finish(row), draws: finishDraws(row.draws) }))
+      .filter(row => row.sales > 0)
+      .sort((a, b) => a.label.localeCompare(b.label));
+    const totals = usersList.reduce((sum, row) => ({
+      sales: sum.sales + row.sales,
+      prizes: sum.prizes + row.prizes,
+      commission: sum.commission + row.commission,
+      utility: sum.utility + row.utility
+    }), { sales: 0, prizes: 0, commission: 0, utility: 0 });
 
-    const reportStartDate = consolidatedMode === 'day' ? consolidatedReportDate : consolidatedStartDate;
-    const reportEndDate = consolidatedMode === 'day' ? consolidatedReportDate : consolidatedEndDate;
+    return {
+      users: usersList,
+      draws: finishDraws(globalDraws),
+      totals: finish(totals)
+    };
+  }, [activeTab, allLiquidationUsersValue, businessDayKey, getTicketPrizesFromSource, liquidationDate, liquidationEnd, liquidationResultsSnapshot, liquidationScopeEmail, liquidationTicketsSnapshot, lotteries, results, tickets, users]);
 
-    if (!reportStartDate || !reportEndDate) {
-      toast.error('Selecciona el rango de fechas del consolidado');
-      return;
-    }
-
-    if (reportStartDate > reportEndDate) {
-      toast.error('La fecha inicial no puede ser mayor que la fecha final');
-      return;
-    }
-
-    const { start } = getBusinessDayRange(reportStartDate);
-    const { end } = getBusinessDayRange(reportEndDate);
-
-    const toastId = toast.loading(`Generando consolidado ${reportStartDate} -> ${reportEndDate}...`);
-    setIsGeneratingYesterdayReport(true);
-
+  const shareLiquidationPdf = async () => {
+    if (!liquidationReport) return;
+    const isGlobal = liquidationScopeEmail === allLiquidationUsersValue;
+    const toastId = toast.loading('Generando liquidación...');
+    setIsSharingLiquidation(true);
     try {
-      const [ticketsSnap, settlementsSnap, resultsSnap, archivesSnap] = await Promise.all([
-        getDocs(query(
-          collection(db, 'tickets'),
-          where('timestamp', '>=', start),
-          where('timestamp', '<', end),
-          limit(5000)
-        )),
-        getDocs(query(
-          collection(db, 'settlements'),
-          where('date', '>=', reportStartDate),
-          where('date', '<=', reportEndDate),
-          limit(3000)
-        )),
-        getDocs(query(
-          collection(db, 'results'),
-          where('date', '>=', reportStartDate),
-          where('date', '<=', reportEndDate),
-          limit(300)
-        )),
-        getDocs(query(
-          collection(db, 'daily_archives'),
-          where('date', '>=', reportStartDate),
-          where('date', '<=', reportEndDate),
-          limit(120)
-        ))
-      ]);
-
-      const archivedPayload = archivesSnap.docs.map(d => d.data() as {
-        date?: string;
-        tickets?: LotteryTicket[];
-        settlements?: Settlement[];
-        results?: LotteryResult[];
-      });
-      const archivedTickets = archivedPayload.flatMap(item => item.tickets || []);
-      const archivedSettlements = archivedPayload.flatMap(item => item.settlements || []);
-      const archivedResults = archivedPayload.flatMap(item => item.results || []);
-
-      const dedupeById = <T extends { id?: string }>(items: T[]) => {
-        const map = new Map<string, T>();
-        items.forEach((item, index) => {
-          const key = item?.id || `no-id-${index}`;
-          if (!map.has(key)) map.set(key, item);
-        });
-        return Array.from(map.values());
-      };
-
-      const reportTickets = dedupeById([
-        ...ticketsSnap.docs.map(d => ({ id: d.id, ...d.data() } as LotteryTicket)),
-        ...archivedTickets
-      ])
-        .filter(t => {
-          const normalizedStatus = String(t.status || '').toLowerCase();
-          return normalizedStatus !== 'cancelled';
-        });
-      const reportSettlements = dedupeById([
-        ...settlementsSnap.docs.map(d => ({ id: d.id, ...d.data() } as Settlement)),
-        ...archivedSettlements
-      ]);
-      const reportResults = dedupeById([
-        ...resultsSnap.docs.map(d => ({ id: d.id, ...d.data() } as LotteryResult)),
-        ...archivedResults
-      ]);
-
-      type ReportUserData = {
-        key: string;
-        email: string;
-        name: string;
-        sellerId?: string;
-        summary: ReturnType<typeof buildFinancialSummary>;
-        tickets: LotteryTicket[];
-      };
-      const reportUsersMap = new Map<string, ReportUserData>();
-      const normalizeText = (value?: string) => (value || '').toLowerCase().trim();
-      const findUserProfileByEmail = (email: string) => users.find(u => normalizeText(u.email) === normalizeText(email));
-      const findUserProfileBySeller = (sellerId?: string, fallbackName?: string) => {
-        const seller = normalizeText(sellerId);
-        if (seller) {
-          const bySeller = users.find(u => normalizeText(u.sellerId) === seller);
-          if (bySeller) return bySeller;
-        }
-        const fallback = normalizeText(fallbackName);
-        if (fallback) {
-          return users.find(u => normalizeText(u.name) === fallback);
-        }
-        return undefined;
-      };
-      const createEmptySummary = () => ({
-        tickets: [] as LotteryTicket[],
-        settlements: [] as Settlement[],
-        totalSales: 0,
-        totalCommissions: 0,
-        totalPrizes: 0,
-        totalLiquidations: 0,
-        netProfit: 0
-      });
-      const ensureReportUser = (identity: {
-        key: string;
-        email?: string;
-        fallbackName?: string;
-        fallbackSellerId?: string;
-      }) => {
-        if (!reportUsersMap.has(identity.key)) {
-          const email = normalizeText(identity.email);
-          const profile = email
-            ? findUserProfileByEmail(email)
-            : findUserProfileBySeller(identity.fallbackSellerId, identity.fallbackName);
-          reportUsersMap.set(identity.key, {
-            key: identity.key,
-            email: email || normalizeText(profile?.email),
-            name: getUserLabel({ email: email || profile?.email, name: profile?.name || identity.fallbackName }) || 'Usuario',
-            sellerId: profile?.sellerId || identity.fallbackSellerId,
-            summary: createEmptySummary(),
-            tickets: []
-          });
-        }
-        return reportUsersMap.get(identity.key)!;
-      };
-
-      const getTicketIdentity = (ticket: LotteryTicket) => {
-        const email = normalizeText(ticket.sellerEmail);
-        const sellerRef = normalizeText(ticket.sellerId || ticket.sellerCode);
-        const nameRef = normalizeText(ticket.sellerName);
-        if (email) {
-          return { key: `email:${email}`, email, fallbackName: ticket.sellerName, fallbackSellerId: ticket.sellerCode || ticket.sellerId };
-        }
-        if (sellerRef) {
-          return { key: `seller:${sellerRef}`, email: '', fallbackName: ticket.sellerName, fallbackSellerId: ticket.sellerCode || ticket.sellerId };
-        }
-        return { key: `name:${nameRef || 'sin-nombre'}`, email: '', fallbackName: ticket.sellerName || 'Sin nombre', fallbackSellerId: ticket.sellerCode || ticket.sellerId };
-      };
-
-      reportTickets.forEach(ticket => {
-        const identity = getTicketIdentity(ticket);
-        const userData = ensureReportUser(identity);
-        userData.tickets.push(ticket);
-      });
-      reportSettlements.forEach(settlement => {
-        const email = normalizeText(settlement.userEmail);
-        ensureReportUser({ key: `email:${email || 'sin-correo'}`, email });
-      });
-
-      reportUsersMap.forEach((userData) => {
-        const userTickets = [...userData.tickets].sort((a, b) => {
-          const aTime = (a.timestamp as any)?.toDate?.()?.getTime?.() ?? 0;
-          const bTime = (b.timestamp as any)?.toDate?.()?.getTime?.() ?? 0;
-          return aTime - bTime;
-        });
-        const normalizedUserEmail = normalizeText(userData.email);
-        const userSettlements = normalizedUserEmail
-          ? reportSettlements.filter(settlement => normalizeText(settlement.userEmail) === normalizedUserEmail)
-          : [];
-
-        const totalSales = userTickets.reduce((sum, ticket) => sum + (ticket.totalAmount || 0), 0);
-        const totalCommissions = userTickets.reduce((sum, ticket) => sum + ((ticket.totalAmount || 0) * ((ticket.commissionRate || 0) / 100)), 0);
-        const totalPrizes = userTickets.reduce((sum, ticket) => sum + (getTicketPrizesFromSource(ticket, reportResults).totalPrize || 0), 0);
-        const totalLiquidations = userSettlements.reduce((sum, settlement) => sum + (settlement.amountPaid || 0), 0);
-        const netProfit = totalSales - totalCommissions - totalPrizes;
-
-        userData.summary = {
-          tickets: userTickets,
-          settlements: userSettlements,
-          totalSales,
-          totalCommissions,
-          totalPrizes,
-          totalLiquidations,
-          netProfit
-        };
-        userData.tickets = userTickets;
-      });
-
-      const reportUsers = Array.from(reportUsersMap.values())
-        .filter(userData => (
-          userData.summary.totalSales > 0 ||
-          userData.summary.totalPrizes > 0 ||
-          userData.summary.totalLiquidations > 0
-        ))
-        .sort((a, b) => cleanTextForExport(a.name).localeCompare(cleanTextForExport(b.name)));
-
       const pdf = createReportPdf();
-      const marginX = 12;
-      const maxWidth = 186;
+      const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
-      const lineHeight = 5;
-      let y = 14;
-
-      const ensureSpace = (lines = 1) => {
-        if (y + (lines * lineHeight) > pageHeight - 12) {
+      const margin = 14;
+      let y = 16;
+      const money = (value: number) => `${value < 0 ? '-' : ''}$${Math.abs(value).toFixed(2)}`;
+      const colRight = [pageWidth - margin - 78, pageWidth - margin - 52, pageWidth - margin - 26, pageWidth - margin];
+      const ensureSpace = (height: number) => {
+        if (y + height > pageHeight - margin) {
           pdf.addPage();
-          y = 14;
+          y = margin;
         }
       };
-
-      const writeLine = (text: string, font: 'normal' | 'bold' = 'normal', size = 9) => {
-        pdf.setFont('helvetica', font);
-        pdf.setFontSize(size);
-        const safeText = cleanTextForExport(text);
-        const lines = pdf.splitTextToSize(safeText || ' ', maxWidth) as string[];
-        lines.forEach(line => {
-          ensureSpace(1);
-          pdf.text(line, marginX, y);
-          y += lineHeight;
-        });
+      const tableHeader = (firstColumn: string) => {
+        ensureSpace(14);
+        pdf.setFillColor(241, 245, 249);
+        pdf.rect(margin, y - 4.5, pageWidth - margin * 2, 7, 'F');
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(8);
+        pdf.setTextColor(71, 85, 105);
+        pdf.text(firstColumn, margin + 2, y);
+        ['VENTA', 'PREMIOS', 'COMISION', 'UTILIDAD'].forEach((title, index) => pdf.text(title, colRight[index], y, { align: 'right' }));
+        y += 6;
+      };
+      const tableRow = (label: string, row: { sales: number; prizes: number; commission: number; utility: number }, bold = false) => {
+        ensureSpace(7);
+        pdf.setFont('helvetica', bold ? 'bold' : 'normal');
+        pdf.setFontSize(8.5);
+        pdf.setTextColor(30, 41, 59);
+        pdf.text(label, margin + 2, y, { maxWidth: colRight[0] - margin - 22 });
+        pdf.text(money(row.sales), colRight[0], y, { align: 'right' });
+        pdf.setTextColor(190, 18, 60);
+        pdf.text(money(row.prizes), colRight[1], y, { align: 'right' });
+        pdf.setTextColor(29, 78, 216);
+        pdf.text(money(row.commission), colRight[2], y, { align: 'right' });
+        pdf.setFont('helvetica', 'bold');
+        pdf.setTextColor(row.utility >= 0 ? 4 : 190, row.utility >= 0 ? 120 : 18, row.utility >= 0 ? 87 : 60);
+        pdf.text(money(row.utility), colRight[3], y, { align: 'right' });
+        pdf.setDrawColor(226, 232, 240);
+        pdf.line(margin, y + 2, pageWidth - margin, y + 2);
+        y += 6.5;
+      };
+      const sectionTitle = (title: string) => {
+        ensureSpace(16);
+        y += 3;
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(10.5);
+        pdf.setTextColor(15, 23, 42);
+        pdf.text(title, margin, y);
+        y += 7;
       };
 
-      const separator = () => {
-        writeLine('==================================================', 'normal', 8);
-      };
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(17);
+      pdf.setTextColor(15, 23, 42);
+      pdf.text(isGlobal ? 'LIQUIDACION GLOBAL' : 'LIQUIDACION FINAL', margin, y);
+      y += 7;
+      pdf.setFontSize(10);
+      pdf.setTextColor(37, 99, 235);
+      pdf.text(isGlobal ? 'Todos los usuarios' : (liquidationReport.users[0]?.label || getUserLabel(userProfile)), margin, y);
+      y += 5.5;
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(9);
+      pdf.setTextColor(100, 116, 139);
+      pdf.text(`Fecha: ${liquidationDateLabel}`, margin, y);
+      y += 8;
 
-      const globalSales = reportUsers.reduce((acc, u) => acc + u.summary.totalSales, 0);
-      const globalPrizes = reportUsers.reduce((acc, u) => acc + u.summary.totalPrizes, 0);
-      const globalCommissions = reportUsers.reduce((acc, u) => acc + u.summary.totalCommissions, 0);
-      const globalLiquidations = reportUsers.reduce((acc, u) => acc + u.summary.totalLiquidations, 0);
-      const globalNet = globalSales - globalCommissions - globalPrizes;
-
-      writeLine('REPORTE CONSOLIDADO EJECUTIVO', 'bold', 15);
-      writeLine(`Rango operativo: ${reportStartDate} -> ${reportEndDate}`, 'bold', 10);
-      writeLine(`Generado: ${format(new Date(), 'dd/MM/yyyy hh:mm a')}`, 'normal', 9);
-      separator();
-      writeLine('RESUMEN GLOBAL', 'bold', 11);
-      writeLine(`Usuarios con actividad: ${reportUsers.length}`);
-      writeLine(`Total ventas: USD ${globalSales.toFixed(2)}`);
-      writeLine(`Total premios: USD ${globalPrizes.toFixed(2)}`);
-      writeLine(`Total liquidaciones (monto pagado): USD ${globalLiquidations.toFixed(2)}`);
-      writeLine(`Neto global estimado: USD ${globalNet.toFixed(2)}`, 'bold', 10);
-      separator();
-
-      if (reportUsers.length === 0) writeLine('Sin datos para el rango seleccionado.', 'bold', 10);
-
-      reportUsers.forEach((ru) => {
-        ensureSpace(6);
-        separator();
-        writeLine(`USUARIO: ${ru.name}`, 'bold', 11);
-        writeLine(`Correo: ${ru.email}`);
-        writeLine(`SellerId: ${ru.sellerId || '-'}`);
-
-        writeLine('SUBTOTALES POR USUARIO', 'bold', 10);
-        writeLine(`Total ventas: USD ${ru.summary.totalSales.toFixed(2)}`);
-        writeLine(`Total comisiones: USD ${ru.summary.totalCommissions.toFixed(2)}`);
-        writeLine(`Total premios: USD ${ru.summary.totalPrizes.toFixed(2)}`);
-        writeLine(`Total liquidaciones (monto pagado): USD ${ru.summary.totalLiquidations.toFixed(2)}`);
-        writeLine(`Neto estimado/final: USD ${ru.summary.netProfit.toFixed(2)}`, 'bold', 10);
-        writeLine(`Tickets vendidos: ${ru.tickets.length}`);
-        if (ru.tickets.length > 0) {
-          writeLine('DETALLE DE TICKETS', 'bold', 10);
-          ru.tickets.forEach((ticket, index) => {
-            const ticketDate = (ticket.timestamp as any)?.toDate?.()
-              ? format((ticket.timestamp as any).toDate(), 'dd/MM/yyyy hh:mm a')
-              : '-';
-            const statusLabel = ticket.status === 'winner' ? 'GANADOR' : (ticket.status || 'active').toUpperCase();
-            const isWinner = ticket.status === 'winner';
-            writeLine(`${index + 1}. Ticket ${ticket.id?.slice(0, 8) || '-'} | Fecha: ${ticketDate} | Estado: ${statusLabel}${isWinner ? ' *' : ''}`);
-            if (ticket.customerName) {
-              writeLine(`   Cliente: ${ticket.customerName}`);
-            }
-            const betsSummary = (ticket.bets || [])
-              .map((bet) => `${bet.number}-${cleanTextForExport(bet.lottery)} x${bet.amount}`)
-              .join(' | ');
-            if (betsSummary) {
-              writeLine(`   Jugadas: ${betsSummary}`);
-            }
-            writeLine(`   Total ticket: USD ${(ticket.totalAmount || 0).toFixed(2)}`);
-          });
-        }
-        separator();
+      const { totals } = liquidationReport;
+      pdf.setFillColor(totals.utility >= 0 ? 236 : 254, totals.utility >= 0 ? 253 : 242, totals.utility >= 0 ? 245 : 242);
+      pdf.roundedRect(margin, y, pageWidth - margin * 2, 24, 2, 2, 'F');
+      const summaryItems: [string, string][] = [
+        ['VENTAS', money(totals.sales)],
+        ['PREMIOS', money(totals.prizes)],
+        ['COMISION', money(totals.commission)],
+        ['UTILIDAD', money(totals.utility)]
+      ];
+      const boxWidth = (pageWidth - margin * 2) / 4;
+      summaryItems.forEach(([label, value], index) => {
+        const centerX = margin + boxWidth * index + boxWidth / 2;
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(7.5);
+        pdf.setTextColor(100, 116, 139);
+        pdf.text(label, centerX, y + 8, { align: 'center' });
+        pdf.setFontSize(12);
+        pdf.setTextColor(15, 23, 42);
+        pdf.text(value, centerX, y + 16, { align: 'center' });
       });
+      y += 30;
 
-      const consolidatedName = `${cleanTextForExport(`Reporte-Consolidado-${reportStartDate}-a-${reportEndDate}`)}.pdf`;
-      const consolidatedResult = await sharePdfDocument(pdf, consolidatedName, 'Reporte consolidado', `Reporte consolidado ${reportStartDate} a ${reportEndDate}`);
-      if (consolidatedResult === 'shared') {
-        toast.success('Reporte consolidado compartido', { id: toastId });
-      } else if (consolidatedResult === 'cancelled') {
+      if (isGlobal && liquidationReport.users.length > 0) {
+        sectionTitle('RESUMEN POR USUARIO');
+        tableHeader('USUARIO');
+        liquidationReport.users.forEach(row => tableRow(row.label, row));
+        tableRow('TOTAL', totals, true);
+      }
+
+      sectionTitle(isGlobal ? 'RESUMEN POR SORTEO' : 'DETALLE POR SORTEO');
+      tableHeader('SORTEO');
+      if (liquidationReport.draws.length === 0) {
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(9);
+        pdf.setTextColor(100, 116, 139);
+        pdf.text('No hay ventas para esta fecha.', margin + 2, y);
+        y += 7;
+      }
+      liquidationReport.draws.forEach(row => tableRow(`${row.name}${row.time ? ` ${row.time}` : ''}`, row));
+
+      if (isGlobal && liquidationReport.users.length > 0) {
+        sectionTitle('DETALLE POR USUARIO');
+        liquidationReport.users.forEach(userRow => {
+          ensureSpace(30);
+          y += 2;
+          pdf.setFont('helvetica', 'bold');
+          pdf.setFontSize(9.5);
+          pdf.setTextColor(37, 99, 235);
+          pdf.text(userRow.label, margin, y);
+          y += 6;
+          tableHeader('SORTEO');
+          userRow.draws.forEach(row => tableRow(`${row.name}${row.time ? ` ${row.time}` : ''}`, row));
+          tableRow('TOTAL USUARIO', userRow, true);
+        });
+      }
+
+      const fileName = `${cleanTextForExport(`${isGlobal ? 'Liquidacion-Global' : 'Liquidacion'}-${liquidationDateLabel.replace(/ /g, '-')}`)}.pdf`;
+      const result = await sharePdfDocument(pdf, fileName, isGlobal ? 'Liquidacion global' : 'Liquidacion final', `Liquidacion ${liquidationDateLabel}`);
+      if (result === 'shared') {
+        toast.success('Liquidación compartida', { id: toastId });
+      } else if (result === 'cancelled') {
         toast.dismiss(toastId);
       } else {
         toast.info('Se descargó el PDF para compartirlo manualmente', { id: toastId });
       }
     } catch (error) {
-      console.error('Error generating consolidated report:', error);
-      toast.error('No se pudo generar el reporte consolidado', { id: toastId });
+      console.error('Error generating liquidation PDF:', error);
+      toast.error('No se pudo generar la liquidación', { id: toastId });
     } finally {
-      setIsGeneratingYesterdayReport(false);
+      setIsSharingLiquidation(false);
     }
   };
 
@@ -7418,6 +7330,21 @@ Diferencia: ${signedCurrency(difference)}`,
       cierreNode.style.margin = originalMargin;
       cierreNode.style.backgroundColor = originalBackgroundColor;
     }
+  };
+
+  const openNumberTickets = (source: LotteryTicket[], lotteryName: string, type: 'CH' | 'PL' | 'BL', number: string) => {
+    const rows = source.flatMap(ticket => {
+      const matches = (ticket.bets || []).filter(bet => (
+        bet && cleanText(bet.lottery) === cleanText(lotteryName) && getBetTypeLabel(bet.type) === type && bet.number === number
+      ));
+      if (matches.length === 0) return [];
+      return [{
+        ticket,
+        amount: matches.reduce((sum, bet) => sum + (bet.amount || 0), 0),
+        quantity: matches.reduce((sum, bet) => sum + (bet.quantity || 0), 0)
+      }];
+    }).sort((a, b) => b.amount - a.amount);
+    setNumberTicketsModal({ lotteryName, type, number, rows });
   };
 
   const handleStatsReportExport = async (
@@ -7755,31 +7682,6 @@ Diferencia: ${signedCurrency(difference)}`,
     });
   }, [getQuickOperationalDate, recentOperationalDates]);
   
-  const todayStats = useMemo(() => {
-    // Force global aggregation for today's summary: include all sellers' tickets for today
-    const todayTickets = tickets.filter(t => {
-      const tDate = getTicketDateKey(t);
-      const matchesDate = tDate === todayStr;
-      // Do not filter by seller for today's summary — include all (non-cancelled) tickets
-      return matchesDate && t.status !== 'cancelled';
-    });
-    const summary = buildFinancialSummary({
-      tickets: todayTickets,
-      targetDate: todayStr
-    });
-    const bankProfit = summary.totalSales - summary.totalCommissions - summary.totalPrizes;
-    const pendingDebt = userProfile?.currentDebt || 0;
-
-    return {
-      sales: summary.totalSales,
-      commissions: summary.totalCommissions,
-      prizes: summary.totalPrizes,
-      bankProfit,
-      netProfit: summary.netProfit,
-      pendingDebt
-    };
-  }, [buildFinancialSummary, getTicketDateKey, tickets, todayStr, userProfile]);
-
   // Cabecera: siempre solo los datos del usuario logueado
   const myTodayStats = useMemo(() => {
     const myEmail = user?.email?.toLowerCase();
@@ -8546,7 +8448,7 @@ Diferencia: ${signedCurrency(difference)}`,
       setArchiveTickets(prev => prev.map(applyTicketUpdate));
       setLiquidationTicketsSnapshot(prev => prev.map(applyTicketUpdate));
 
-      historyDataCacheRef.current.clear();
+      historyDataCacheRef.current.clear();liquidationDayCacheRef.current.clear();
       closedLotteryCardsCacheRef.current.clear();
       await fetchRecoveryData();
 
@@ -8615,7 +8517,7 @@ Diferencia: ${signedCurrency(difference)}`,
             setArchiveTickets(prev => prev.filter(item => item.id !== ticket.id));
           }
 
-          historyDataCacheRef.current.clear();
+          historyDataCacheRef.current.clear();liquidationDayCacheRef.current.clear();
           closedLotteryCardsCacheRef.current.clear();
           await fetchRecoveryData();
 
@@ -8636,34 +8538,57 @@ Diferencia: ${signedCurrency(difference)}`,
   }, [activeTab, fetchRecoveryData, userProfile?.role]);
 
   useEffect(() => {
-    if (activeTab !== 'liquidaciones' || !selectedUserToLiquidate || !liquidationDate) {
+    if (activeTab !== 'liquidaciones' || !liquidationDate) {
       setLiquidationTicketsSnapshot([]);
       setLiquidationResultsSnapshot([]);
-      setLiquidationSettlementsSnapshot([]);
       return;
     }
 
-    if (liquidationDate === businessDayKey) {
+    const lastDay = liquidationEndDate && liquidationEndDate > liquidationDate ? liquidationEndDate : liquidationDate;
+    const pastDays: string[] = [];
+    const cursor = new Date(`${liquidationDate}T12:00:00`);
+    while (pastDays.length < 31) {
+      const dayKey = format(cursor, 'yyyy-MM-dd');
+      if (dayKey > lastDay) break;
+      if (dayKey < businessDayKey) pastDays.push(dayKey);
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
+    if (pastDays.length === 0) {
       setLiquidationTicketsSnapshot([]);
       setLiquidationResultsSnapshot([]);
-      setLiquidationSettlementsSnapshot([]);
       return;
     }
 
+    const scopeEmail = canChooseLiquidationUser
+      ? allLiquidationUsersValue
+      : (userProfile?.email || '').toLowerCase();
     let cancelled = false;
     setIsLiquidationDataLoading(true);
 
-    fetchUserOperationalDataByDate(liquidationDate, selectedUserToLiquidate)
-      .then(dayData => {
-        if (cancelled) return;
-        setLiquidationTicketsSnapshot(dayData.tickets);
-        setLiquidationResultsSnapshot(dayData.results);
-        setLiquidationSettlementsSnapshot(dayData.settlements);
-      })
+    (async () => {
+      const collectedTickets: LotteryTicket[] = [];
+      const collectedResults: LotteryResult[] = [];
+      for (const day of pastDays) {
+        const cacheKey = `${day}|${scopeEmail}`;
+        let dayData = liquidationDayCacheRef.current.get(cacheKey);
+        if (!dayData) {
+          const fetched = await fetchUserOperationalDataByDate(day, scopeEmail);
+          dayData = { tickets: fetched.tickets, results: fetched.results };
+          // Solo se guardan días que ya tienen resultados para no congelar datos incompletos.
+          if (fetched.results.length > 0) liquidationDayCacheRef.current.set(cacheKey, dayData);
+        }
+        collectedTickets.push(...dayData.tickets);
+        collectedResults.push(...dayData.results);
+      }
+      if (cancelled) return;
+      setLiquidationTicketsSnapshot(collectedTickets);
+      setLiquidationResultsSnapshot(collectedResults);
+    })()
       .catch(error => {
         if (cancelled) return;
         console.error('Error loading liquidation source data:', error);
-        toast.error('No se pudieron cargar los datos históricos para liquidación');
+        toast.error('No se pudieron cargar los datos históricos de la liquidación');
       })
       .finally(() => {
         if (!cancelled) setIsLiquidationDataLoading(false);
@@ -8672,7 +8597,7 @@ Diferencia: ${signedCurrency(difference)}`,
     return () => {
       cancelled = true;
     };
-  }, [activeTab, businessDayKey, fetchUserOperationalDataByDate, liquidationDate, selectedUserToLiquidate]);
+  }, [activeTab, allLiquidationUsersValue, businessDayKey, canChooseLiquidationUser, fetchUserOperationalDataByDate, liquidationDate, liquidationEndDate, userProfile?.email]);
 
   const userStats = useMemo(() => {
     const stats: Record<string, { sales: number, commissions: number, prizes: number, utility: number }> = {};
@@ -8713,7 +8638,7 @@ Diferencia: ${signedCurrency(difference)}`,
   const configTabsList: { id: string; label: string; visible: boolean }[] = [
     { id: 'sorteos', label: 'Sorteos', visible: isConfigAdmin },
     { id: 'usuarios', label: 'Usuarios', visible: isConfigAdmin || !!userProfile?.canLiquidate },
-    { id: 'chances', label: 'Chances', visible: true },
+    { id: 'chances', label: 'Chances', visible: userProfile?.role !== 'seller' },
     { id: 'especiales', label: 'Especiales', visible: isConfigAdmin },
     { id: 'dispositivos', label: 'Dispositivos', visible: true },
     { id: 'perfil', label: 'Mi Perfil', visible: true },
@@ -8802,6 +8727,56 @@ Diferencia: ${signedCurrency(difference)}`,
         comboType={betType === 'BL' ? 'BL' : 'PL'}
       />
 
+      {numberTicketsModal && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" onClick={() => setNumberTicketsModal(null)}>
+          <div className="flex max-h-[80vh] w-full max-w-md flex-col rounded-2xl border border-white/10 bg-gradient-to-b from-[#1A1F30] to-[#0B1220] shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between gap-3 border-b border-white/10 p-4">
+              <div className="flex min-w-0 items-center gap-3">
+                <div className="flex h-12 min-w-12 shrink-0 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 px-2 text-primary">
+                  <span className="text-lg font-black">{numberTicketsModal.type === 'CH' ? numberTicketsModal.number : `${numberTicketsModal.type} ${numberTicketsModal.number}`}</span>
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-lg font-bold leading-tight text-white">Detalle de Ventas</h2>
+                  <p className="truncate text-xs text-slate-400">{cleanText(numberTicketsModal.lotteryName)} · {numberTicketsModal.rows.length} ticket(s)</p>
+                </div>
+              </div>
+              <button onClick={() => setNumberTicketsModal(null)} className="rounded-full p-2 transition-colors hover:bg-white/10">
+                <X size={20} className="text-slate-400" />
+              </button>
+            </div>
+            <div className="flex-1 space-y-2 overflow-y-auto p-4">
+              {numberTicketsModal.rows.length > 0 ? numberTicketsModal.rows.map(({ ticket, amount, quantity }) => {
+                const ticketDate = ticket.timestamp?.toDate ? ticket.timestamp.toDate() : new Date(ticket.timestamp);
+                return (
+                  <button
+                    type="button"
+                    key={ticket.id}
+                    onClick={() => setShowTicketModal({ ticket, selectedLotteryName: numberTicketsModal.lotteryName })}
+                    className="flex w-full items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 p-3 text-left transition-colors hover:bg-white/10"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-bold text-slate-200">{ticket.customerName?.trim() || 'Cliente general'}</p>
+                      <p className="truncate text-[10px] font-mono text-slate-400">
+                        {isNaN(ticketDate.getTime()) ? '--:--' : format(ticketDate, 'hh:mm a')} · {ticket.sellerName || ticket.sellerEmail}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <div className="text-right">
+                        <p className="text-sm font-bold text-white">${amount.toFixed(2)}</p>
+                        {numberTicketsModal.type === 'CH' && <p className="text-xs font-black text-primary">x{quantity}</p>}
+                      </div>
+                      <Receipt className="h-5 w-5 text-slate-300" />
+                    </div>
+                  </button>
+                );
+              }) : (
+                <p className="py-10 text-center text-sm text-slate-400">No se encontraron tickets.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {showTicketModal && (
         <TicketModal 
           ticket={showTicketModal.ticket} 
@@ -8869,7 +8844,7 @@ Diferencia: ${signedCurrency(difference)}`,
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={() => setIsSidebarOpen(false)}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40"
+            className="fixed inset-0 bg-black/60             backdrop-blur-sm z-[55]"
           />
         )}
       </AnimatePresence>
@@ -8881,7 +8856,7 @@ Diferencia: ${signedCurrency(difference)}`,
           width: isMobile ? (isSidebarOpen ? 280 : 0) : (isSidebarOpen ? 280 : 80),
           x: isMobile && !isSidebarOpen ? -280 : 0
         }}
-        className={`glass border-r border-border h-screen flex flex-col z-50 ${isMobile ? 'fixed inset-y-0 left-0' : 'relative'}`}
+        className={`glass border-r border-border h-screen flex flex-col z-[60] ${isMobile ? 'fixed inset-y-0 left-0' : 'relative'}`}
       >
         <div className="p-6 flex items-center gap-3">
           <div className="bg-primary p-2 rounded-lg neon-border">
@@ -8972,7 +8947,7 @@ Diferencia: ${signedCurrency(difference)}`,
       {/* Main Content */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden relative min-w-0">
         {/* Top Header */}
-        <header className="h-16 glass border-b border-border px-3 flex items-center justify-between shrink-0 gap-2">
+        <header className="sticky top-0 z-40 h-16 glass border-b border-border px-3 flex items-center justify-between shrink-0 gap-2">
           <button 
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
             className="p-2 hover:bg-white/5 rounded-lg text-muted-foreground shrink-0"
@@ -9059,7 +9034,7 @@ Diferencia: ${signedCurrency(difference)}`,
                       className="w-full rounded-xl border border-white/10 bg-background px-3 py-2.5 text-sm text-white"
                     >
                       <option value="">Elegir usuario</option>
-                      {users.map(u => (
+                      {users.filter(u => u.role !== 'programador' || userProfile?.role === 'programador').map(u => (
                         <option key={u.email} value={u.email}>{getUserLabel(u)}</option>
                       ))}
                     </select>
@@ -9127,8 +9102,9 @@ Diferencia: ${signedCurrency(difference)}`,
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
-                className="max-w-md mx-auto space-y-4 pb-24"
+                className={isDesktopLayout ? 'mx-auto grid w-full max-w-6xl grid-cols-[minmax(0,28rem)_minmax(0,1fr)] items-start gap-8 pb-8' : 'max-w-md mx-auto space-y-4 pb-24'}
               >
+                <div className="space-y-4">
                 {/* Lottery Selector */}
                 <div className="glass-card p-3 flex items-center justify-between relative z-30">
                   <div className="flex items-center gap-3">
@@ -9260,7 +9236,7 @@ Diferencia: ${signedCurrency(difference)}`,
                       Palé
                     </button>
                   )}
-                  {globalSettings.billetesEnabled && (isMultipleMode ? multiLottery.some(name => lotteryAllowsBillete(findActiveLotteryByName(name))) : lotteryAllowsBillete(findActiveLotteryByName(selectedLottery))) && (
+                  {globalSettings.billetesEnabled && (isMultipleMode ? multiLottery.some(name => { const l = findActiveLotteryByName(name); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); }) : (() => { const l = findActiveLotteryByName(selectedLottery); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); })()) && (
                     <button
                       onClick={() => {
                         setBetType('BL');
@@ -9430,6 +9406,8 @@ Diferencia: ${signedCurrency(difference)}`,
                   Agregar al Ticket
                 </button>
 
+                </div>
+                <div className="space-y-4">
                 {/* Cart Preview (Compact) */}
                 {cart.length > 0 && (
                   <div className="glass-card p-3 space-y-2">
@@ -9437,7 +9415,7 @@ Diferencia: ${signedCurrency(difference)}`,
                       <h3 className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">Carrito ({cart.length})</h3>
                       <button onClick={clearCart} className="text-[11px] font-bold uppercase text-red-500">Vaciar</button>
                     </div>
-                    <div className="max-h-32 overflow-y-auto space-y-2 custom-scrollbar pr-1">
+                    <div className={`${isDesktopLayout ? 'max-h-[45vh]' : 'max-h-32'} overflow-y-auto space-y-2 custom-scrollbar pr-1`}>
                       {Object.entries(
                         cart.reduce((acc, bet, idx) => {
                           if (!acc[bet.lottery]) acc[bet.lottery] = [];
@@ -9534,48 +9512,7 @@ Diferencia: ${signedCurrency(difference)}`,
                   Copiado Rápido
                 </button>
 
-                {/* Seller Daily Balance Summary */}
-                {userProfile?.role === 'seller' && (
-                  <div className="glass-card p-4 space-y-4 border-primary/20 bg-primary/5">
-                    <div className="flex items-center justify-between border-b border-primary/10 pb-2">
-                      <div className="flex items-center gap-2">
-                        <LayoutDashboard className="w-4 h-4 text-primary" />
-                        <h3 className="text-xs font-black uppercase tracking-[0.2em] text-primary">Resumen del Día</h3>
-                      </div>
-                      <span className="text-xs font-mono font-bold opacity-70">{todayStr}</span>
-                    </div>
-                    
-                    <div className="grid grid-cols-2 gap-x-6 gap-y-4">
-                      <div>
-                        <p className="text-[11px] uppercase text-white/70 font-extrabold tracking-wider mb-1">Ventas Brutas</p>
-                        <p className="text-sm font-black">${todayStats.sales.toFixed(2)}</p>
-                      </div>
-                      <div>
-                        <p className="text-[11px] uppercase text-white/70 font-extrabold tracking-wider mb-1">Premios</p>
-                        <p className="text-sm font-black text-red-400">${todayStats.prizes.toFixed(2)}</p>
-                      </div>
-                      <div>
-                        <p className="text-[11px] uppercase text-white/70 font-extrabold tracking-wider mb-1">Utilidad Banca</p>
-                        <p className={`text-sm font-black ${todayStats.bankProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                          ${todayStats.bankProfit.toFixed(2)}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="pt-3 border-t border-primary/10 flex justify-between items-center">
-                      <div>
-                        <p className="text-[11px] uppercase text-white/70 font-extrabold tracking-wider">Deuda Pendiente</p>
-                        <p className="text-lg font-black text-red-500">${todayStats.pendingDebt.toFixed(2)}</p>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-[11px] uppercase text-white/70 font-extrabold tracking-wider">Balance Neto</p>
-                        <p className={`text-lg font-black ${todayStats.netProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          ${todayStats.netProfit.toFixed(2)}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                </div>
               </motion.div>
             )}
 
@@ -10114,9 +10051,12 @@ Diferencia: ${signedCurrency(difference)}`,
                                                 const quantity = chanceTotals.get(number) || 0;
                                                 const isTopSeller = topChanceNumbers.has(number);
                                                 return (
-                                                  <div
+                                                  <button
+                                                    type="button"
                                                     key={number}
-                                                    className={`flex min-h-10 flex-col items-center justify-center rounded-md border p-0.5 ${
+                                                    disabled={quantity <= 0}
+                                                    onClick={() => openNumberTickets(reportTickets, lotteryName, 'CH', number)}
+                                                    className={`flex min-h-10 flex-col items-center justify-center rounded-md border p-0.5 transition-transform active:scale-95 ${
                                                       quantity > 0 ? 'border-primary/20 bg-primary/10' : 'border-white/5 bg-black/40'
                                                     }`}
                                                   >
@@ -10126,7 +10066,7 @@ Diferencia: ${signedCurrency(difference)}`,
                                                     }`}>
                                                       {quantity > 0 ? quantity : '-'}
                                                     </span>
-                                                  </div>
+                                                  </button>
                                                 );
                                               })}
                                             </div>
@@ -10148,11 +10088,16 @@ Diferencia: ${signedCurrency(difference)}`,
                                                   <h5 className="mb-1.5 text-[9px] font-black uppercase tracking-widest text-muted-foreground">{group.title}</h5>
                                                   <div className="grid grid-cols-[repeat(auto-fill,minmax(132px,1fr))] gap-2">
                                                     {group.rows.map(([key, total]) => (
-                                                      <div key={key} className="flex h-9 min-w-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg border border-primary/20 bg-primary/5 px-2">
+                                                      <button
+                                                        type="button"
+                                                        key={key}
+                                                        onClick={() => openNumberTickets(reportTickets, lotteryName, key.startsWith('PL ') ? 'PL' : 'BL', key.slice(3))}
+                                                        className="flex h-9 min-w-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg border border-primary/20 bg-primary/5 px-2 transition-transform active:scale-95"
+                                                      >
                                                         <span className="text-[11px] font-bold text-white">{key}</span>
                                                         <span className="text-[11px] font-semibold text-muted-foreground">-</span>
                                                         <span className="text-[11px] font-black text-primary">${total.toFixed(2)}</span>
-                                                      </div>
+                                                      </button>
                                                     ))}
                                                   </div>
                                                 </div>
@@ -10332,10 +10277,16 @@ Diferencia: ${signedCurrency(difference)}`,
                                         const num = String(i).padStart(2, '0');
                                         const qty = chanceTotals.get(num) || 0;
                                         return (
-                                          <div key={num} className="flex min-h-10 flex-col items-center justify-center rounded bg-white/[0.03] px-0.5 py-1">
+                                          <button
+                                            type="button"
+                                            key={num}
+                                            disabled={!qty}
+                                            onClick={() => openNumberTickets(scopedTickets, lot.name, 'CH', num)}
+                                            className="flex min-h-10 flex-col items-center justify-center rounded bg-white/[0.03] px-0.5 py-1 transition-transform active:scale-95"
+                                          >
                                             <span className="text-[8px] font-bold text-slate-400">{num}</span>
                                             <span className={`text-[9px] font-black ${qty ? 'text-emerald-300' : 'text-slate-700'}`}>{qty || '-'}</span>
-                                          </div>
+                                          </button>
                                         );
                                       })}
                                     </div>
@@ -10355,11 +10306,16 @@ Diferencia: ${signedCurrency(difference)}`,
                                             <h5 className="mb-1.5 text-[9px] font-black uppercase tracking-widest text-muted-foreground">{group.title}</h5>
                                             <div className="grid grid-cols-[repeat(auto-fill,minmax(132px,1fr))] gap-2">
                                               {group.rows.map(combo => (
-                                                <div key={`${combo.type}-${combo.number}`} className="flex h-9 min-w-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg border border-primary/20 bg-primary/5 px-2">
+                                                <button
+                                                  type="button"
+                                                  key={`${combo.type}-${combo.number}`}
+                                                  onClick={() => openNumberTickets(scopedTickets, lot.name, combo.type === 'PL' ? 'PL' : 'BL', combo.number)}
+                                                  className="flex h-9 min-w-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg border border-primary/20 bg-primary/5 px-2 transition-transform active:scale-95"
+                                                >
                                                   <span className="text-[11px] font-bold text-white">{group.label} {combo.number}</span>
                                                   <span className="text-[11px] font-semibold text-muted-foreground">-</span>
                                                   <span className="text-[11px] font-black text-primary">${combo.amount.toFixed(2)}</span>
-                                                </div>
+                                                </button>
                                               ))}
                                             </div>
                                           </div>
@@ -10712,734 +10668,311 @@ Diferencia: ${signedCurrency(difference)}`,
               </motion.div>
             )}
 
-            {activeTab === 'users' && (
-              <motion.div
-                key="users"
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: 20 }}
-                className="space-y-8"
-              >
-                {configTabsBar}
-                {/* User Management Section */}
-                <div className="glass-card p-4 sm:p-6 md:p-10">
-                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-10 gap-6">
-                    <div>
-                      <h2 className="text-2xl font-black italic tracking-tighter neon-text uppercase">USUARIOS</h2>
-                      <p className="text-xs font-mono text-muted-foreground mt-1 uppercase tracking-widest">Gestión de Accesos y Comisiones</p>
-                    </div>
-                    <div className="flex items-center gap-4 w-full sm:w-auto">
-                      <select 
-                        value={selectedManageUserEmail}
-                        onChange={(e) => setSelectedManageUserEmail(e.target.value)}
-                        className="w-full sm:w-64 bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                      >
-                        <option key="default" value="" className="bg-gray-900">Seleccionar usuario...</option>
-                        {(() => {
-                          const validUsers = users.filter(u => u && u.email);
-                          if ((userProfile?.role === 'ceo' || userProfile?.role === 'programador') && !validUsers.some(u => u.email === userProfile.email)) {
-                            validUsers.unshift(userProfile);
-                          }
-                          return validUsers.map((u, i) => {
-                            const stats = userStats[u.email.toLowerCase()];
-                            const isLowUtility = stats && stats.utility < 0;
-                            return (
-                              <option 
-                                key={u.email || `manage-${i}`} 
-                                value={u.email} 
-                                className={`bg-gray-900 ${isLowUtility ? 'text-red-500 font-bold' : ''}`}
-                              >
-                                {getUserLabel(u)} {isLowUtility ? '?' : ''}
-                              </option>
-                            );
-                          });
-                        })()}
-                      </select>
-                      {(userProfile?.role === 'ceo' || userProfile?.role === 'programador') && (
-                        <button 
+            {activeTab === 'users' && (() => {
+              const canManageUsers = userProfile?.role === 'ceo' || userProfile?.role === 'programador';
+              const listedUsers = users.filter(u => u && u.email && (u.role !== 'programador' || userProfile?.role === 'programador'));
+              if (userProfile?.email && userProfile.role === 'programador' && !listedUsers.some(u => u.email?.toLowerCase() === userProfile.email.toLowerCase())) {
+                listedUsers.unshift(userProfile);
+              }
+              const roleOrder: Record<string, number> = { ceo: 0, programador: 1, admin: 2, seller: 3 };
+              const roleLabels: Record<string, string> = { ceo: 'CEO', programador: 'Programador', admin: 'Administrador', seller: 'Vendedor' };
+              const sortedUsers = [...listedUsers].sort((a, b) =>
+                (roleOrder[a.role] ?? 9) - (roleOrder[b.role] ?? 9) ||
+                getUserLabel(a).localeCompare(getUserLabel(b))
+              );
+              const toggleUserStatus = async (target: UserProfile) => {
+                const nextStatus = target.status === 'active' ? 'inactive' : 'active';
+                try {
+                  await updateDoc(doc(db, 'users', target.email.toLowerCase()), { status: nextStatus });
+                  setUsers(prev => prev.map(item => item.email?.toLowerCase() === target.email.toLowerCase() ? { ...item, status: nextStatus } : item));
+                  toast.success(nextStatus === 'active' ? 'Usuario activado' : 'Usuario desactivado');
+                } catch (error) {
+                  handleFirestoreError(error, OperationType.UPDATE, `users/${target.email}`);
+                }
+              };
+              const shareUserAccess = async (target: UserProfile) => {
+                const text = `usuario: ${target.email}`;
+                try {
+                  if (navigator.share) await navigator.share({ title: 'Acceso', text });
+                  else {
+                    await navigator.clipboard.writeText(text);
+                    toast.success('Usuario copiado');
+                  }
+                } catch (error) {
+                  if ((error as Error)?.name !== 'AbortError') toast.error('No se pudo compartir');
+                }
+              };
+
+              return (
+                <motion.div
+                  key="users"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  className="space-y-4"
+                >
+                  {configTabsBar}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-2 px-1">
+                      <div>
+                        <h2 className="text-sm font-black text-white uppercase tracking-widest">Gestión de Usuarios</h2>
+                        <p className="text-xs text-slate-500 font-bold uppercase tracking-wider">Crea y administra los usuarios.</p>
+                      </div>
+                      {canManageUsers && (
+                        <button
                           onClick={() => {
                             setEditingUser(null);
                             setShowUserModal(true);
                           }}
-                          className="w-full sm:w-auto bg-primary text-primary-foreground px-6 py-3 rounded-xl font-bold uppercase text-xs tracking-widest flex items-center justify-center gap-2 hover:brightness-110 transition-all"
+                          className="bg-primary text-primary-foreground px-4 h-10 rounded-xl font-bold text-xs uppercase tracking-wider flex items-center gap-2 shadow-lg shadow-primary/20 active:scale-95 transition-all shrink-0 whitespace-nowrap"
                         >
-                          <Plus className="w-4 h-4" /> Nuevo Usuario
+                          <Plus className="w-4 h-4" /> Añadir Usuario
                         </button>
                       )}
                     </div>
-                  </div>
-                  
-                  {selectedManageUserEmail ? (() => {
-                    const validUsers = users.filter(u => u && u.email);
-                    if ((userProfile?.role === 'ceo' || userProfile?.role === 'programador') && !validUsers.some(u => u.email === userProfile.email)) {
-                      validUsers.unshift(userProfile);
-                    }
-                    const u = validUsers.find(user => user.email === selectedManageUserEmail);
-                    if (!u) return null;
-                    const stats = userStats[u.email.toLowerCase()];
-                    return (
-                      <div className="glass-card p-6 border-white/5 bg-white/[0.01] transition-all">
-                        <div className="flex justify-between items-start mb-6 border-b border-border/50 pb-4">
-                          <div className="flex items-center gap-4">
-                            <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center">
-                              <UserIcon className="w-6 h-6 text-primary" />
-                            </div>
-                            <div>
-                              <p className="font-black text-sm uppercase tracking-tight text-white/90">{getUserLabel(u)}</p>
-                              <div className="flex items-center gap-2 mt-1">
-                                <p className="text-xs font-mono font-bold text-muted-foreground uppercase tracking-widest">{u.role}</p>
-                                <span className="text-muted-foreground">•</span>
-                                <p className="text-xs font-mono font-semibold text-muted-foreground">{u.email}</p>
-                              </div>
-                            </div>
-                          </div>
-                          <div className="flex flex-col items-end gap-2">
-                            <span className={`px-2 py-1 rounded text-[11px] font-black uppercase tracking-widest ${
-                              u.status === 'active' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-                            }`}>
-                              {u.status}
-                            </span>
-                            {stats && stats.utility < 0 && (
-                              <span className="bg-red-500 text-white px-2 py-0.5 rounded text-[11px] font-black uppercase animate-pulse">
-                                Saldo Negativo
-                              </span>
-                            )}
-                          </div>
-                        </div>
 
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-                          <div className="bg-black/40 p-4 rounded-xl border border-white/5">
-                            <p className="text-xs font-mono font-bold text-white/70 uppercase tracking-widest mb-1">Comisión Asignada</p>
-                            <p className="text-xl font-black text-white">{u.commissionRate}%</p>
-                          </div>
-                          <div className="bg-black/40 p-4 rounded-xl border border-white/5">
-                            <div className="flex items-start justify-between gap-3 mb-2">
-                              <p className="text-xs font-mono font-bold text-white/70 uppercase tracking-widest">Deuda Actual</p>
-                              {canManageMoneyAdjustments && editingDebtUserEmail !== u.email && (
-                                <button
-                                  onClick={() => {
-                                    setEditingDebtUserEmail(u.email);
-                                    setEditingDebtAmount(String(u.currentDebt || 0));
-                                  }}
-                                  className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-white transition-all"
-                                  title="Editar deuda"
-                                >
-                                  <Edit2 className="w-3.5 h-3.5" />
+                    <div className="space-y-2">
+                      {sortedUsers.map((u, i) => {
+                        const isActive = (u.status || 'active') === 'active';
+                        const isProtected = u.role === 'ceo' || u.role === 'programador';
+                        return (
+                          <div
+                            key={u.email || `user-${i}`}
+                            className={`rounded-2xl border bg-white/5 p-3 ${isActive ? 'border-white/10' : 'border-red-500/20 opacity-70'}`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <h4 className="truncate text-sm font-bold tracking-tight text-white">{getUserLabel(u)}</h4>
+                                  <span className="shrink-0 rounded-md border border-primary/30 bg-primary/15 px-1.5 py-0.5 text-[10px] font-black text-primary">{u.commissionRate ?? 0}%</span>
+                                  {!isActive && (
+                                    <span className="shrink-0 rounded-md border border-red-500/30 bg-red-500/20 px-2 py-0.5 text-[8px] font-black uppercase tracking-widest text-red-400">Inactivo</span>
+                                  )}
+                                </div>
+                                <p className="mt-0.5 truncate text-xs font-bold uppercase tracking-wider text-slate-400">
+                                  {u.email} · {roleLabels[u.role] || u.role}
+                                </p>
+                              </div>
+                              <div className="flex shrink-0 items-center">
+                                <button onClick={() => shareUserAccess(u)} title="Compartir usuario" className="rounded-lg p-2 text-slate-500 transition-colors hover:text-white">
+                                  <Share2 className="h-4 w-4" />
                                 </button>
-                              )}
-                            </div>
-                            {editingDebtUserEmail === u.email ? (
-                              <div className="space-y-2">
-                                <input
-                                  type="number"
-                                  value={editingDebtAmount}
-                                  onChange={(e) => setEditingDebtAmount(e.target.value)}
-                                  className="w-full bg-black border border-border p-2 rounded-lg font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                                />
-                                <div className="grid grid-cols-2 gap-2">
+                                {canManageUsers && !isProtected && (
                                   <button
-                                    onClick={() => saveUserDebt(u)}
-                                    disabled={isSavingDebt}
-                                    className="py-2 rounded-lg bg-primary text-primary-foreground text-xs font-black uppercase tracking-widest disabled:opacity-50"
+                                    onClick={() => toggleUserStatus(u)}
+                                    title={isActive ? 'Desactivar' : 'Activar'}
+                                    className={`rounded-lg p-2 transition-all active:scale-90 ${isActive ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-400'}`}
                                   >
-                                    Guardar
+                                    {isActive ? <ToggleRight className="h-6 w-6" /> : <ToggleLeft className="h-6 w-6" />}
                                   </button>
+                                )}
+                                {canManageUsers && (
                                   <button
                                     onClick={() => {
-                                      setEditingDebtUserEmail('');
-                                      setEditingDebtAmount('');
+                                      setEditingUser(u);
+                                      setShowUserModal(true);
                                     }}
-                                    className="py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs font-black uppercase tracking-widest"
+                                    title="Editar"
+                                    className="rounded-lg p-2 text-slate-500 transition-colors hover:text-white"
                                   >
-                                    Cancelar
+                                    <Edit2 className="h-4 w-4" />
                                   </button>
-                                </div>
-                              </div>
-                            ) : (
-                              <p className={`text-xl font-black ${u.currentDebt && u.currentDebt > 0 ? 'text-red-400' : 'text-green-400'}`}>
-                                USD {(u.currentDebt || 0).toFixed(2)}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex flex-wrap items-center gap-3">
-                          {(userProfile?.role === 'ceo' || userProfile?.role === 'programador') && (
-                            <button 
-                              onClick={() => {
-                                setEditingUser(u);
-                                setShowUserModal(true);
-                              }}
-                              disabled={u.role === 'ceo' && userProfile?.role !== 'ceo' && userProfile?.role !== 'programador'}
-                              className="flex-1 min-w-0 bg-white/5 hover:bg-white/10 text-white py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-                            >
-                              <Settings className="w-4 h-4" /> Configurar
-                            </button>
-                          )}
-                          
-                          {(userProfile?.role === 'ceo' || userProfile?.role === 'programador') && u.role !== 'ceo' && u.role !== 'programador' && (
-                            <button 
-                              onClick={() => deleteUser(u.email)}
-                              className="p-3 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-xl transition-all"
-                              title="Eliminar Usuario"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })() : (
-                    <div className="h-64 flex items-center justify-center text-muted-foreground font-mono text-sm uppercase tracking-widest border-2 border-dashed border-border rounded-2xl p-10">
-                      Seleccione un usuario para ver y gestionar sus detalles
-                    </div>
-                  )}
-                </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'liquidaciones' && (
-              <motion.div
-                key="liquidaciones"
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: 20 }}
-                className="space-y-8"
-              >
-                <div className="glass-card p-4 sm:p-6 md:p-10">
-                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-10 gap-6">
-                    <div>
-                      <h2 className="text-2xl font-black italic tracking-tighter neon-text uppercase">LIQUIDACIONES</h2>
-                      <p className="text-xs font-mono text-muted-foreground mt-1 uppercase tracking-widest">Cierre de caja y reporte de ventas</p>
-                    </div>
-                    {canConfirmLiquidation && (
-                      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full sm:w-auto">
-                        <div className="hidden">
-                          <button
-                            onClick={() => setConsolidatedMode('day')}
-                            className={`px-3 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${consolidatedMode === 'day' ? 'bg-primary text-primary-foreground' : 'bg-white/5 text-muted-foreground'}`}
-                          >
-                            Un Día
-                          </button>
-                          <button
-                            onClick={() => setConsolidatedMode('range')}
-                            className={`px-3 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${consolidatedMode === 'range' ? 'bg-primary text-primary-foreground' : 'bg-white/5 text-muted-foreground'}`}
-                          >
-                            Rango
-                          </button>
-                        </div>
-                        {consolidatedMode === 'day' ? (
-                          <input
-                            type="date"
-                            value={consolidatedReportDate}
-                            onChange={(e) => {
-                              setConsolidatedReportDate(e.target.value);
-                              setConsolidatedStartDate(e.target.value);
-                              setConsolidatedEndDate(e.target.value);
-                            }}
-                            className="hidden"
-                          />
-                        ) : (
-                          <div className="hidden">
-                            <input
-                              type="date"
-                              value={consolidatedStartDate}
-                              onChange={(e) => setConsolidatedStartDate(e.target.value)}
-                              className="hidden"
-                            />
-                            <input
-                              type="date"
-                              value={consolidatedEndDate}
-                              onChange={(e) => setConsolidatedEndDate(e.target.value)}
-                              className="hidden"
-                            />
-                          </div>
-                        )}
-                        <select
-                          value={consolidatedMode === 'day' ? consolidatedReportDate : consolidatedEndDate}
-                          onChange={(e) => {
-                            if (consolidatedMode === 'day') {
-                              setConsolidatedReportDate(e.target.value);
-                            } else {
-                              setConsolidatedEndDate(e.target.value);
-                            }
-                          }}
-                          className="hidden"
-                        >
-                          {recentOperationalDates.map(dateValue => (
-                            <option key={`consolidated-${dateValue}`} value={dateValue} className="bg-gray-900">{dateValue}</option>
-                          ))}
-                        </select>
-                        <button
-                          onClick={() => {
-                            setConsolidatedMode('day');
-                            setConsolidatedReportDate(liquidationDate);
-                            setConsolidatedStartDate(liquidationDate);
-                            setConsolidatedEndDate(liquidationDate);
-                            setTimeout(generateConsolidatedReport, 0);
-                          }}
-                          disabled={
-                            isGeneratingYesterdayReport ||
-                            !liquidationDate
-                          }
-                          className="bg-primary text-primary-foreground font-black uppercase tracking-widest px-4 py-3 rounded-xl hover:brightness-110 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                        >
-                          {isGeneratingYesterdayReport ? 'Generando PDF...' : 'Descargar Consolidado'}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-
-                  {(() => {
-                    const isCurrentOperationalDate = liquidationDate === businessDayKey;
-                    const sourceTickets = isCurrentOperationalDate ? tickets : liquidationTicketsSnapshot;
-                    const sourceResults = isCurrentOperationalDate ? results : liquidationResultsSnapshot;
-                    const sourceSettlements = isCurrentOperationalDate ? settlements : liquidationSettlementsSnapshot;
-                    const liquidationUsersSource = [...users];
-                    if (userProfile?.role === 'ceo' && userProfile.email && !liquidationUsersSource.some(u => u.email?.toLowerCase() === userProfile.email.toLowerCase())) {
-                      liquidationUsersSource.unshift(userProfile);
-                    }
-                    const liquidableUsers = liquidationUsersSource.filter(u => {
-                      if (!u || !u.email) return false;
-                      if (canChooseLiquidationUser) return u.status === 'active' || u.role === 'ceo';
-                      return u.email?.toLowerCase() === userProfile?.email?.toLowerCase();
-                    });
-                    const formatLiquidationUserLabel = (u: UserProfile) => {
-                      const emailName = (u.email?.split('@')[0] || '').trim();
-                      const rawCode = (u.sellerId || emailName || '').trim();
-                      const code = rawCode.toUpperCase();
-                      const username = (emailName || rawCode).toUpperCase();
-                      return `${code || username} - ${username}`;
-                    };
-                    const visibleLiquidationUsers = selectedLiquidationIsAll
-                      ? liquidableUsers
-                      : liquidableUsers.filter(u => u.email === selectedUserToLiquidate);
-                    const getUserSettlement = (email: string) => {
-                      const normalizedEmail = email.toLowerCase();
-                      return sourceSettlements
-                        .filter(settlement => (settlement.userEmail || '').toLowerCase() === normalizedEmail && settlement.date === liquidationDate)
-                        .sort((a, b) => {
-                          const aTime = a.timestamp?.toDate?.()?.getTime?.() ?? (a.timestamp?.seconds ? a.timestamp.seconds * 1000 : 0);
-                          const bTime = b.timestamp?.toDate?.()?.getTime?.() ?? (b.timestamp?.seconds ? b.timestamp.seconds * 1000 : 0);
-                          return bTime - aTime;
-                        })[0] || null;
-                    };
-                    const getUserSummary = (email: string) => {
-                      const summary = buildFinancialSummary({
-                        tickets: sourceTickets,
-                        userEmail: email,
-                        targetDate: liquidationDate,
-                        prizeResolver: (ticket: LotteryTicket) => getTicketPrizesFromSource(ticket, sourceResults)
-                      });
-                      const resultadoDia = summary.totalSales - summary.totalCommissions - summary.totalPrizes;
-                      const balanceFinal = resultadoDia;
-                      return { summary, resultadoDia, balanceFinal };
-                    };
-                    const selectedUserSummary = selectedUserToLiquidate && !selectedLiquidationIsAll
-                      ? getUserSummary(selectedUserToLiquidate)
-                      : null;
-                    const globalSummary = selectedLiquidationIsAll ? buildFinancialSummary({
-                      tickets: sourceTickets,
-                      targetDate: liquidationDate,
-                      prizeResolver: (ticket: LotteryTicket) => getTicketPrizesFromSource(ticket, sourceResults)
-                    }) : null;
-                    const globalResultadoDia = globalSummary
-                      ? globalSummary.totalSales - globalSummary.totalCommissions - globalSummary.totalPrizes
-                      : 0;
-                    const globalBalanceFinal = globalResultadoDia;
-                    const receivedAmount = Number(amountPaid) || 0;
-                    const selectedDifference = selectedUserSummary ? selectedUserSummary.balanceFinal - receivedAmount : 0;
-                    const historyRows = sourceSettlements
-                      .filter(settlement => selectedLiquidationIsAll || !selectedUserToLiquidate || (settlement.userEmail || '').toLowerCase() === selectedUserToLiquidate.toLowerCase())
-                      .sort((a, b) => {
-                        const dateCompare = (b.date || '').localeCompare(a.date || '');
-                        if (dateCompare !== 0) return dateCompare;
-                        const aTime = a.timestamp?.toDate?.()?.getTime?.() ?? (a.timestamp?.seconds ? a.timestamp.seconds * 1000 : 0);
-                        const bTime = b.timestamp?.toDate?.()?.getTime?.() ?? (b.timestamp?.seconds ? b.timestamp.seconds * 1000 : 0);
-                        return bTime - aTime;
-                      })
-                      .slice(0, 3);
-
-                    return (
-                      <div className="space-y-8">
-                        <div className="space-y-4">
-                          <div className="space-y-2">
-                            <label className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Fecha operativa</label>
-                            <div className="space-y-2">
-                              <input
-                                type="date"
-                                value={liquidationDate}
-                                onChange={(e) => setLiquidationDate(e.target.value)}
-                                className="w-full bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                              />
-                            </div>
-                            {liquidationDate !== businessDayKey && isLiquidationDataLoading && (
-                              <p className="text-xs font-mono font-bold text-muted-foreground uppercase tracking-widest">Cargando datos...</p>
-                            )}
-                          </div>
-
-                          <div className="space-y-2">
-                            <label className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Usuario</label>
-                            {canChooseLiquidationUser ? (
-                              <select
-                                value={selectedUserToLiquidate}
-                                onChange={(e) => setSelectedUserToLiquidate(e.target.value)}
-                                className="w-full bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                              >
-                                <option value={allLiquidationUsersValue} className="bg-gray-900">Todos</option>
-                                {liquidableUsers.map((u, i) => (
-                                  <option key={u.email || `liq-${i}`} value={u.email} className="bg-gray-900">
-                                    {formatLiquidationUserLabel(u)}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : (
-                              <div className="bg-white/5 border border-border p-3 rounded-xl text-sm font-bold text-white">
-                                {userProfile?.name || user?.email}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {selectedLiquidationIsAll && globalSummary ? (
-                          <div className="border border-white/10 bg-black/30 rounded-xl p-5 space-y-5">
-                            <div className="border-b border-white/10 pb-4">
-                              <h3 className="text-lg font-black text-white">NEGOCIO - RESUMEN GLOBAL</h3>
-                              <p className="mt-1 text-xs font-mono font-bold uppercase tracking-widest text-muted-foreground">Vista global informativa. Seleccione un usuario para liquidar.</p>
-                            </div>
-                            <div className="space-y-3">
-                              <div className="flex items-center justify-between border-b border-white/5 pb-2"><span className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Ventas</span><span className="text-sm font-black text-white">USD {globalSummary.totalSales.toFixed(2)}</span></div>
-                              <div className="flex items-center justify-between border-b border-white/5 pb-2"><span className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Comision</span><span className="text-sm font-black text-amber-400">USD {globalSummary.totalCommissions.toFixed(2)}</span></div>
-                              <div className="flex items-center justify-between border-b border-white/5 pb-2"><span className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Premios</span><span className="text-sm font-black text-red-400">USD {globalSummary.totalPrizes.toFixed(2)}</span></div>
-                              <div className="flex items-center justify-between border-b border-white/5 pb-2"><span className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Resultado</span><span className={`text-base font-black ${signedAmountClass(globalResultadoDia)}`}>{signedCurrency(globalResultadoDia)}</span></div>
-                              <div className="flex items-center justify-between gap-3 bg-white/5 border border-white/10 rounded-xl p-3"><span className="shrink-0 text-[11px] sm:text-xs font-mono font-bold uppercase tracking-widest text-white/70">Balance final</span><span className={`min-w-0 text-right whitespace-nowrap text-lg sm:text-2xl font-black ${signedAmountClass(globalBalanceFinal)}`}>{signedCurrency(globalBalanceFinal)}</span></div>
-                            </div>
-                          </div>
-                        ) : visibleLiquidationUsers.length > 0 ? (
-                          <div className="space-y-4">
-                            {visibleLiquidationUsers.map(liqUser => {
-                              const userSummary = getUserSummary(liqUser.email);
-                              const userSettlement = getUserSettlement(liqUser.email);
-                              const liquidationCardId = `liquidation-summary-${(liqUser.email || '').replace(/[^a-zA-Z0-9_-]/g, '-')}`;
-                              return (
-                                <div id={liquidationCardId} key={liqUser.email} className="border border-white/10 bg-black/30 rounded-xl p-5 space-y-5">
-                                  <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-4">
-                                    <div>
-                                      <p className="                                      text-xs font-mono font-bold uppercase tracking-widest text-white/70">Usuario</p>
-                                      <h3 className="text-lg font-black text-white">{getUserLabel(liqUser)}</h3>
-                                    </div>
-                                    <p className="text-xs font-mono text-muted-foreground">{liqUser.sellerId || liqUser.email?.split('@')[0]}</p>
-                                  </div>
-                                  <div className="space-y-3">
-                                    <div><p className="text-[11px] font-bold uppercase tracking-widest text-white/70">Ventas</p><p className="text-sm font-black text-white">USD {userSummary.summary.totalSales.toFixed(2)}</p></div>
-                                    <div><p className="text-[11px] font-bold uppercase tracking-widest text-white/70">Comision</p><p className="text-sm font-black text-amber-400">USD {userSummary.summary.totalCommissions.toFixed(2)}</p></div>
-                                    <div><p className="text-[11px] font-bold uppercase tracking-widest text-white/70">Premios</p><p className="text-sm font-black text-red-400">USD {userSummary.summary.totalPrizes.toFixed(2)}</p></div>
-                                  </div>
-                                  <div className="space-y-3">
-                                    <div className="flex items-center justify-between border-b border-white/5 pb-2"><span className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Resultado</span><span className={`text-base font-black ${signedAmountClass(userSummary.resultadoDia)}`}>{signedCurrency(userSummary.resultadoDia)}</span></div>
-                                    <div className="flex items-center justify-between gap-3 bg-white/5 border border-white/10 rounded-xl p-3"><span className="shrink-0 text-[11px] sm:text-xs font-mono font-bold uppercase tracking-widest text-white/70">Balance final</span><span className={`min-w-0 text-right whitespace-nowrap text-lg sm:text-2xl font-black ${signedAmountClass(userSummary.balanceFinal)}`}>{signedCurrency(userSummary.balanceFinal)}</span></div>
-                                  </div>
-                                  {userSettlement && (
-                                    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10                                     px-3 py-2 text-xs font-black uppercase tracking-widest text-emerald-300">
-                                      Liquidacion registrada: USD {(userSettlement.amountPaid || 0).toFixed(2)}
-                                    </div>
-                                  )}
-                                  {!selectedLiquidationIsAll && (
-                                    <button
-                                      onClick={() => shareElementAsImage({
-                                        elementId: liquidationCardId,
-                                        fileName: `Liquidacion-${cleanText(liqUser.name || liqUser.email || 'Usuario')}-${liquidationDate}.png`,
-                                        title: 'Reporte de Liquidacion',
-                                        text: `Liquidacion de ${liqUser.name || liqUser.email || 'Usuario'} para la fecha ${liquidationDate}`,
-                                        dialogTitle: 'Compartir Liquidacion'
-                                      })}
-                                      className="w-full bg-white/10 hover:bg-white/20 text-white py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2 no-print"
-                                    >
-                                      <Share2 className="w-4 h-4" /> Compartir
-                                    </button>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-
-                        {selectedUserSummary && canConfirmLiquidation && !selectedLiquidationIsAll && (
-                          <div className="border border-primary/25 bg-primary/5 rounded-xl p-5 space-y-5">
-                            <h3 className="text-sm font-black uppercase tracking-widest text-primary">Liquidar</h3>
-                            <div className="space-y-4">
-                              <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-black/20 p-3"><p className="shrink-0 text-[11px] sm:text-xs font-mono font-bold uppercase tracking-widest text-white/70">Balance final</p><p className={`min-w-0 text-right whitespace-nowrap text-lg sm:text-2xl font-black ${signedAmountClass(selectedUserSummary.balanceFinal)}`}>{signedCurrency(selectedUserSummary.balanceFinal)}</p></div>
-                              <div className="space-y-2">
-                                <label className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Monto recibido</label>
-                                <input type="number" value={amountPaid === 'NaN' ? '' : amountPaid} onChange={(e) => setAmountPaid(e.target.value)} placeholder="0.00" className="w-full bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all" />
-                              </div>
-                              <div><p className="text-xs font-mono font-bold uppercase tracking-widest text-white/70 mb-1">Diferencia</p><p className={`text-2xl font-black ${signedAmountClass(selectedDifference)}`}>{signedCurrency(selectedDifference)}</p></div>
-                            </div>
-                            <button onClick={handleLiquidate} className="w-full bg-primary text-primary-foreground font-black uppercase tracking-widest py-4 rounded-xl hover:brightness-110 transition-all shadow-lg shadow-primary/20">Confirmar liquidacion</button>
-                          </div>
-                        )}
-
-                        {!selectedLiquidationIsAll && selectedUserToLiquidate && (
-                        <div className="space-y-3">
-                          <h3 className="text-sm font-black uppercase tracking-widest text-muted-foreground">Historial</h3>
-                          <div className="space-y-3">
-                            {historyRows.length > 0 ? historyRows.map((settlement, index) => {
-                              const settlementUser = users.find(u => (u.email || '').toLowerCase() === (settlement.userEmail || '').toLowerCase());
-                              const rowResultado = settlement.resultadoDia ?? settlement.netProfit ?? ((settlement.totalSales || 0) - (settlement.totalCommissions || 0) - (settlement.totalPrizes || 0));
-                              const rowBalance = settlement.balanceFinal ?? rowResultado;
-                              const rowDifference = settlement.difference ?? settlement.debtAdded ?? (rowBalance - (settlement.amountPaid || 0));
-                              return (
-                                <div key={settlement.id || `${settlement.userEmail}-${settlement.date}-${index}`} className="rounded-xl border border-white/10 bg-black/30 p-4 space-y-3">
-                                  <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-3">
-                                    <p className="text-xs font-mono text-muted-foreground">{settlement.date}</p>
-                                    <p className="text-xs font-black text-white text-right">{settlementUser?.name || settlement.userEmail}</p>
-                                  </div>
-                                  <div className="space-y-2 text-sm">
-                                    <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Resultado:</span><span className={`font-black ${signedAmountClass(rowResultado)}`}>{signedCurrency(rowResultado)}</span></div>
-                                    <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Balance final:</span><span className={`font-black ${signedAmountClass(rowBalance)}`}>{signedCurrency(rowBalance)}</span></div>
-                                    <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Recibido:</span><span className="font-black text-white">USD {(settlement.amountPaid || 0).toFixed(2)}</span></div>
-                                    <div className="flex items-center justify-between gap-3"><span className="text-muted-foreground">Diferencia:</span><span className={`font-black ${signedAmountClass(rowDifference)}`}>{signedCurrency(rowDifference)}</span></div>
-                                  </div>
-                                </div>
-                              );
-                            }) : (
-                              <div className="rounded-xl border border-white/10 bg-black/30 p-6 text-center text-xs font-mono uppercase tracking-widest text-muted-foreground">Sin liquidaciones registradas</div>
-                            )}
-                          </div>
-                        </div>
-                        )}
-                      </div>
-                    );
-                  })()}
-
-                  {false && (
-                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                    <div className="lg:col-span-1 space-y-6">
-                      <div className="space-y-2">
-                        <label className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Fecha de Liquidación</label>
-                        <input 
-                          type="date"
-                          value={liquidationDate}
-                          onChange={(e) => setLiquidationDate(e.target.value)}
-                          className="w-full bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                        />
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => applyOperationalQuickDate(setLiquidationDate, 0)}
-                                                        className="px-2 py-1 rounded-md bg-white/5 text-xs font-black uppercase tracking-widest"
-                          >
-                            Hoy
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => applyOperationalQuickDate(setLiquidationDate, -1)}
-                                                        className="px-2 py-1 rounded-md bg-white/5 text-xs font-black uppercase tracking-widest"
-                          >
-                            Ayer
-                          </button>
-                        </div>
-                        <select
-                          value={liquidationDate}
-                          onChange={(e) => setLiquidationDate(e.target.value)}
-                          className="w-full bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                        >
-                          {liquidacionQuickDateOptions.map(option => (
-                            <option key={`liq-${option.value}`} value={option.value} className="bg-gray-900">{option.label}</option>
-                          ))}
-                        </select>
-                        {liquidationDate !== businessDayKey && isLiquidationDataLoading && (
-                          <p className="text-xs font-mono font-bold text-white/70 uppercase tracking-widest">Cargando datos históricos...</p>
-                        )}
-                      </div>
-
-                      {(userProfile?.role === 'ceo' || userProfile?.canLiquidate) ? (
-                        <div className="space-y-2">
-                          <label className="                          text-xs font-mono font-bold uppercase tracking-widest text-white/70">Seleccionar Usuario</label>
-                          <select 
-                            value={selectedUserToLiquidate}
-                            onChange={(e) => setSelectedUserToLiquidate(e.target.value)}
-                            className="w-full bg-black border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                          >
-                            <option key="default" value="" className="bg-gray-900">Seleccionar...</option>
-                            {users.filter(u => {
-                              if (!u || !u.email) return false;
-                              if (userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador') return true;
-                              return u.email === userProfile?.email;
-                            }).map((u, i) => (
-                              <option key={u.email || `liq-${i}`} value={u.email} className="bg-gray-900">{getUserLabel(u)}</option>
-                            ))}
-                          </select>
-                        </div>
-                      ) : (
-                        <div className="bg-white/5 p-4 rounded-xl border border-white/10">
-                          <p className="                          text-xs font-mono font-bold text-white/70 uppercase tracking-widest">Usuario</p>
-                          <p className="text-sm font-bold text-white">{userProfile?.name}</p>
-                        </div>
-                      )}
-
-                      {selectedUserToLiquidate && (userProfile?.role === 'ceo' || userProfile?.canLiquidate) && (
-                        <>
-                          {selectedLiquidationSettlement && (
-                            <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2">
-                              <p className="text-xs font-black uppercase tracking-widest text-emerald-300">
-                                LIQUIDADO
-                              </p>
-                              <p className="text-xs font-mono font-bold text-emerald-200">
-                                Monto registrado: USD {(selectedLiquidationSettlement.amountPaid || 0).toFixed(2)}
-                              </p>
-                            </div>
-                          )}
-                          <div className="space-y-2">
-                            <label className="text-xs font-mono font-bold uppercase tracking-widest text-white/70">Monto Entregado (USD)</label>
-                            <input 
-                              type="number" 
-                              value={amountPaid === 'NaN' ? '' : amountPaid}
-                              onChange={(e) => setAmountPaid(e.target.value)}
-                              placeholder="Ej: 150.00"
-                              className="w-full bg-white/5 border border-border p-3 rounded-xl font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary transition-all"
-                            />
-                          </div>
-
-                          <button 
-                            onClick={handleLiquidate}
-                            className="w-full bg-primary text-primary-foreground font-black uppercase tracking-widest py-4 rounded-xl hover:brightness-110 transition-all mt-6 shadow-lg shadow-primary/20"
-                          >
-                            {selectedLiquidationSettlement ? `Actualizar liquidación ${liquidationDate}` : `Liquidar día ${liquidationDate}`}
-                          </button>
-                        </>
-                      )}
-                    </div>
-
-                    <div className="lg:col-span-2">
-                      {selectedUserToLiquidate ? (() => {
-                        const userToLiquidate = users.find(u => u.email === selectedUserToLiquidate);
-                        const isCurrentOperationalDate = liquidationDate === businessDayKey;
-                        const summary = buildFinancialSummary({
-                          tickets: isCurrentOperationalDate ? tickets : liquidationTicketsSnapshot,
-                          userEmail: selectedUserToLiquidate,
-                          targetDate: liquidationDate,
-                          prizeResolver: (ticket: LotteryTicket) => getTicketPrizesFromSource(
-                            ticket,
-                            isCurrentOperationalDate ? results : liquidationResultsSnapshot
-                          )
-                        });
-                        const previousDebt = selectedLiquidationSettlement
-                          ? selectedLiquidationSettlement.previousDebt
-                          : (userToLiquidate?.currentDebt || 0);
-
-                        return (
-                          <div id="liquidation-report" className="glass-card p-8 space-y-8 bg-black border-white/10 relative overflow-hidden">
-                            <div className="absolute top-0 right-0 w-32 h-32 bg-primary/5 rounded-full -mr-16 -mt-16 blur-3xl" />
-                            
-                            <div className="flex justify-between items-start border-b border-white/10 pb-6">
-                              <div>
-                                <h3 className="text-xl font-black uppercase tracking-tighter text-primary">REPORTE DE VENTAS</h3>
-                                <p className="text-xs font-mono font-bold text-white/70 uppercase tracking-widest">{liquidationDate}</p>
-                              </div>
-                              <div className="text-right space-y-1">
-                                <p className="text-xs font-black text-white">{getUserLabel(userToLiquidate)}</p>
-                                <p className="                                text-[11px] font-mono font-bold text-white/70 uppercase">ID: {userToLiquidate?.sellerId}</p>
-                                {selectedLiquidationSettlement && (
-                                  <span className="inline-block rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[11px] font-black uppercase tracking-widest text-emerald-300">
-                                    LIQUIDADO
-                                  </span>
+                                )}
+                                {canManageUsers && !isProtected && (
+                                  <button onClick={() => deleteUser(u.email)} title="Eliminar" className="rounded-lg p-2 text-slate-600 transition-colors hover:text-red-500">
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
                                 )}
                               </div>
                             </div>
-
-                            <div className="space-y-6">
-                              <div className="flex justify-between items-center py-2 border-b border-white/5">
-                                <span className="text-xs font-mono text-muted-foreground uppercase tracking-widest">Ventas Totales</span>
-                                <span className="text-sm font-bold text-white">USD {summary.totalSales.toFixed(2)}</span>
-                              </div>
-                              <div className="flex justify-between items-center py-2 border-b border-white/5">
-                                <span className="text-xs font-mono text-muted-foreground uppercase tracking-widest">Comisiones Generadas</span>
-                                <span className="text-sm font-bold text-amber-400">USD {summary.totalCommissions.toFixed(2)}</span>
-                              </div>
-                              <div className="flex justify-between items-center py-2 border-b border-white/5">
-                                <span className="text-xs font-mono text-muted-foreground uppercase tracking-widest">Premios a Pagar</span>
-                                <span className="text-sm font-bold text-red-400">USD {summary.totalPrizes.toFixed(2)}</span>
-                              </div>
-                              
-                              <div className="bg-primary/5 p-6 rounded-2xl border border-primary/20 flex justify-between items-center">
-                                <div>
-                                  <p className="text-xs font-mono font-bold text-primary uppercase tracking-widest mb-1">Balance Neto del Día</p>
-                                  <p className="text-xs text-muted-foreground uppercase tracking-tighter">Monto a entregar a la casa</p>
-                                </div>
-                                <p className="text-3xl font-black text-primary">USD {summary.netProfit.toFixed(2)}</p>
-                              </div>
-
-                              <div className="pt-4 space-y-3">
-                                <div className="flex justify-between items-center">
-                                  <span className="text-xs font-mono font-bold text-white/70 uppercase tracking-widest">Deuda Acumulada</span>
-                                  <span className="text-sm font-bold text-white">USD {previousDebt.toFixed(2)}</span>
-                                </div>
-                              </div>
-                            </div>
-
-                            <div className="pt-8 flex gap-4 no-print">
-                              <button 
-                                onClick={async () => {
-                                  const reportEl = document.getElementById('liquidation-report');
-                                  if (!reportEl) return;
-                                  
-                                  const toastId = toast.loading('Generando reporte...');
-                                  try {
-                                    // Wait for fonts/images to load
-                                    await document.fonts.ready;
-                                    await new Promise(resolve => setTimeout(resolve, 300));
-                                    
-                                    const lib = await import('html-to-image');
-                                    const dataUrl = await lib.toPng(reportEl, { 
-                                      backgroundColor: '#0f172a', // Use background color of the app
-                                      pixelRatio: 2,
-                                      style: {
-                                        transform: 'scale(1)',
-                                        transformOrigin: 'top left'
-                                      }
-                                    });
-                                    
-                                    const fileName = `Reporte-${userToLiquidate?.name || 'Usuario'}-${liquidationDate}.png`;
-
-                                    const shared = await shareImageDataUrl({
-                                      dataUrl,
-                                      fileName,
-                                      title: 'Reporte de Liquidación',
-                                      text: `Reporte de ventas de ${userToLiquidate?.name || 'Usuario'} para el día ${liquidationDate}`,
-                                      dialogTitle: 'Compartir Reporte'
-                                    });
-
-                                    if (shared) {
-                                      toast.success('Reporte compartido', { id: toastId });
-                                    } else {
-                                      downloadDataUrlFile(dataUrl, fileName);
-                                      toast.info('Tu dispositivo no permite compartir imágenes adjuntas. Se descargó para envío manual.', { id: toastId });
-                                    }
-
-                                  } catch (error) {
-                                    console.error('Error generating report:', error);
-                                    toast.error('Error al generar el reporte', { id: toastId });
-                                  }
-                                }}
-                                className="flex-1 bg-white/10 hover:bg-white/20 text-white py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2"
-                              >
-                                <Share2 className="w-4 h-4" /> Compartir Reporte
-                              </button>
-                            </div>
                           </div>
                         );
-                      })() : (
-                        <div className="h-full flex items-center justify-center text-muted-foreground font-mono text-sm uppercase tracking-widest border-2 border-dashed border-border rounded-2xl p-10">
-                          Seleccione un usuario para ver su reporte detallado
-                        </div>
+                      })}
+                      {sortedUsers.length === 0 && (
+                        <p className="py-8 text-center text-xs font-bold uppercase tracking-widest text-muted-foreground">No hay usuarios</p>
                       )}
                     </div>
                   </div>
-                  )}
+                </motion.div>
+              );
+            })()}
+
+            {activeTab === 'liquidaciones' && (() => {
+              const report = liquidationReport;
+              const isGlobalView = liquidationScopeEmail === allLiquidationUsersValue;
+              const liquidationUsersSource = [...users];
+              if (userProfile?.role === 'ceo' && userProfile.email && !liquidationUsersSource.some(u => u.email?.toLowerCase() === userProfile.email.toLowerCase())) {
+                liquidationUsersSource.unshift(userProfile);
+              }
+              const selectableUsers = liquidationUsersSource.filter(u => u?.email && (u.status === 'active' || u.role === 'ceo') && (u.role !== 'programador' || userProfile?.role === 'programador'));
+              const isPositive = (report?.totals.utility ?? 0) >= 0;
+              const commissionPct = report && report.totals.sales > 0 ? (report.totals.commission / report.totals.sales) * 100 : 0;
+              const metric = (value: number, color: string) => (
+                <span className={`truncate text-right text-[10px] font-black ${color}`}>{value < 0 ? '-' : ''}${Math.abs(value).toFixed(2)}</span>
+              );
+              const tableHead = (label: string) => (
+                <div className="grid grid-cols-[1.3fr_repeat(4,minmax(0,1fr))] gap-1 border-b border-white/10 pb-1 text-[8px] font-black uppercase text-slate-500">
+                  <span>{label}</span><span className="text-right">Venta</span><span className="text-right">Premio</span><span className="text-right">Com.</span><span className="text-right">Util.</span>
                 </div>
-              </motion.div>
-            )}
+              );
+              const tableRow = (key: string, label: string, row: { sales: number; prizes: number; commission: number; utility: number }) => (
+                <div key={key} className="grid grid-cols-[1.3fr_repeat(4,minmax(0,1fr))] items-center gap-1 border-b border-white/5 py-2">
+                  <span className="min-w-0 truncate text-[10px] font-black uppercase text-white">{label}</span>
+                  {metric(row.sales, 'text-white')}
+                  {metric(row.prizes, 'text-rose-300')}
+                  {metric(row.commission, 'text-blue-300')}
+                  {metric(row.utility, row.utility >= 0 ? 'text-emerald-300' : 'text-rose-300')}
+                </div>
+              );
+
+              return (
+                <motion.div
+                  key="liquidaciones"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  className="space-y-4"
+                >
+                  <div className="glass-card p-4 sm:p-6 space-y-4">
+                    <div className="flex flex-col gap-3 border-b border-white/10 pb-3">
+                      <div>
+                        <h2 className="text-lg font-black italic tracking-tighter neon-text uppercase">Liquidación final</h2>
+                        <p className="mt-1 text-[10px] font-mono font-bold uppercase tracking-widest text-muted-foreground">{liquidationDateLabel}</p>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="flex h-10 items-center gap-2 rounded-xl border border-white/15 bg-black/40 px-3 text-slate-300">
+                          <span className="text-[9px] font-black uppercase">Desde</span>
+                          <input
+                            type="date"
+                            value={liquidationDate}
+                            onChange={(e) => setLiquidationDate(e.target.value)}
+                            className="min-w-0 w-full bg-transparent text-[11px] font-bold text-white outline-none"
+                          />
+                        </label>
+                        <label className="flex h-10 items-center gap-2 rounded-xl border border-white/15 bg-black/40 px-3 text-slate-300">
+                          <span className="text-[9px] font-black uppercase">Hasta</span>
+                          <input
+                            type="date"
+                            value={liquidationEndDate}
+                            min={liquidationDate}
+                            onChange={(e) => setLiquidationEndDate(e.target.value)}
+                            className="min-w-0 w-full bg-transparent text-[11px] font-bold text-white outline-none"
+                          />
+                        </label>
+                        {canChooseLiquidationUser ? (
+                          <select
+                            value={selectedUserToLiquidate}
+                            onChange={(e) => setSelectedUserToLiquidate(e.target.value)}
+                            className="col-span-2 h-10 w-full rounded-xl border border-white/15 bg-black/40 px-3 text-[11px] font-black uppercase tracking-widest text-slate-200 outline-none focus:border-primary"
+                          >
+                            <option value={allLiquidationUsersValue} className="bg-gray-900">Todos</option>
+                            {selectableUsers.map((u, i) => (
+                              <option key={u.email || `liq-${i}`} value={u.email} className="bg-gray-900">
+                                {getUserLabel(u)}{u.sellerId ? ` · ${u.sellerId}` : ''}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <div className="col-span-2 flex h-10 items-center rounded-xl border border-white/15 bg-white/5 px-3 text-xs font-bold text-white">
+                            {getUserLabel(userProfile) || user?.email}
+                          </div>
+                        )}
+                        {canConfirmLiquidation && (
+                          <div className="col-span-2 flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => shareElementAsImage({
+                                elementId: 'liquidation-report-card',
+                                fileName: `Liquidacion-${liquidationDateLabel.replace(/ /g, '-')}.png`,
+                                title: 'Liquidación final',
+                                text: `Liquidación ${liquidationDateLabel}`,
+                                dialogTitle: 'Compartir liquidación'
+                              })}
+                              disabled={isSharingLiquidation || !report}
+                              className="flex h-10 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-widest text-white hover:bg-white/10 active:scale-95 disabled:opacity-50"
+                            >
+                              <Share2 className="h-4 w-4" /> Imagen
+                            </button>
+                            <button
+                              type="button"
+                              onClick={shareLiquidationPdf}
+                              disabled={isSharingLiquidation || !report}
+                              className="flex h-10 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-widest text-white hover:bg-white/10 active:scale-95 disabled:opacity-50"
+                            >
+                              <FileText className="h-4 w-4" /> {isGlobalView ? 'PDF global' : 'PDF'}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div id="liquidation-report-card" className="space-y-4 bg-[#0f172a] p-3 rounded-xl">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="min-w-0 truncate text-xs font-black uppercase text-white">{isGlobalView ? 'Todos los usuarios' : (report?.users[0]?.label || getUserLabel(users.find(u => (u.email || '').toLowerCase() === liquidationScopeEmail.toLowerCase())) || 'Usuario')}</p>
+                        <p className="shrink-0 text-[10px] font-mono font-bold text-slate-400">{liquidationDateLabel}</p>
+                      </div>
+
+                      {liquidationDate !== businessDayKey && isLiquidationDataLoading && (
+                        <p className="text-[10px] font-mono font-bold uppercase tracking-widest text-muted-foreground">Cargando datos...</p>
+                      )}
+
+                      <div className="space-y-1 px-1">
+                        <div className="flex items-center justify-between py-2.5">
+                          <span className="text-xs font-bold text-slate-300">Ventas brutas</span>
+                          <span className="text-sm font-black text-white">${(report?.totals.sales ?? 0).toFixed(2)}</span>
+                        </div>
+                        <div className="flex items-center justify-between border-t border-white/5 py-2.5">
+                          <span className="text-xs font-bold text-slate-300">Premios</span>
+                          <span className="text-sm font-black text-rose-300">-${(report?.totals.prizes ?? 0).toFixed(2)}</span>
+                        </div>
+                        <div className="flex items-center justify-between border-t border-white/5 py-2.5">
+                          <span className="text-xs font-bold text-slate-300">Comisión ({commissionPct.toFixed(2)}%)</span>
+                          <span className="text-sm font-black text-blue-300">-${(report?.totals.commission ?? 0).toFixed(2)}</span>
+                        </div>
+                      </div>
+
+                      <div className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-4 ${isPositive ? 'border-emerald-400/20 bg-emerald-500/10' : 'border-rose-400/20 bg-rose-500/10'}`}>
+                        <div>
+                          <p className="text-[9px] font-black uppercase tracking-widest text-slate-300">Utilidad</p>
+                          <p className="mt-1 text-[9px] font-bold text-slate-400">Ventas - premios - comisión</p>
+                        </div>
+                        <p className={`shrink-0 text-xl font-black ${isPositive ? 'text-emerald-300' : 'text-rose-300'}`}>
+                          {isPositive ? '+' : '-'}${Math.abs(report?.totals.utility ?? 0).toFixed(2)}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4 p-3">
+                      {isGlobalView && (
+                        <section className="space-y-2">
+                          <h3 className="px-1 text-[10px] font-black uppercase tracking-widest text-slate-400">Resumen por usuario</h3>
+                          {report && report.users.length > 0 ? (
+                            <div>
+                              {tableHead('Usuario')}
+                              {report.users.map(row => tableRow(row.key, row.label, row))}
+                            </div>
+                          ) : (
+                            <p className="px-3 py-4 text-center text-xs font-bold text-slate-500">No hay ventas para esta fecha.</p>
+                          )}
+                        </section>
+                      )}
+
+                      <section className="space-y-2">
+                        <h3 className="px-1 text-[10px] font-black uppercase tracking-widest text-slate-400">Resumen por sorteo</h3>
+                        {report && report.draws.length > 0 ? (
+                          <div>
+                            {tableHead('Sorteo')}
+                            {report.draws.map(row => tableRow(row.key, `${row.name}${row.time ? ` ${row.time}` : ''}`, row))}
+                          </div>
+                        ) : (
+                          <p className="px-3 py-4 text-center text-xs font-bold text-slate-500">No hay ventas por sorteo para esta fecha.</p>
+                        )}
+                      </section>
+                    </div>
+                  </div>
+                </motion.div>
+              );
+            })()}
 
             {activeTab === 'archivo' && (
               <motion.div
@@ -11505,6 +11038,7 @@ Diferencia: ${signedCurrency(difference)}`,
                             <option key="default" value="" className="bg-gray-900">Seleccionar...</option>
                             {users.filter(u => {
                               if (!u || !u.email) return false;
+                              if (u.role === 'programador' && userProfile?.role !== 'programador') return false;
                               if (userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador') return true;
                               return u.email === userProfile?.email;
                             }).map((u, i) => (

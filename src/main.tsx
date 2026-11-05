@@ -4,7 +4,7 @@ import './index.css';
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js?v=3', { updateViaCache: 'none' })
+    navigator.serviceWorker.register('/sw.js?v=4', { updateViaCache: 'none' })
       .then(() => navigator.serviceWorker.getRegistrations())
       .then((registrations) => Promise.all(registrations.map((registration) => registration.update())))
       .catch((err) => {

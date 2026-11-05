@@ -37,7 +37,7 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  if (url.pathname === '/manifest.webmanifest') {
+  if (url.pathname === '/manifest.webmanifest' || url.searchParams.has('vcheck')) {
     event.respondWith(fetch(request, { cache: 'no-store' }));
     return;
   }
