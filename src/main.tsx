@@ -13,6 +13,11 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+const isNativeApp = !!(window as any).Capacitor?.isNativePlatform?.();
+if (isNativeApp || window.matchMedia('(display-mode: standalone)').matches || (navigator as any).standalone) {
+  document.documentElement.classList.add('app-compact');
+}
+
 createRoot(document.getElementById('root')!).render(
   <App />,
 );

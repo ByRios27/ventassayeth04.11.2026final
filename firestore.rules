@@ -208,6 +208,11 @@ service cloud.firestore {
       allow write: if isCeo() || isProgramador();
     }
 
+    // Registro interno de lecturas: cada usuario solo escribe su propio documento y nadie lo lee desde la app.
+    match /read_meter/{docId} {
+      allow create, update: if isAuthenticated() && docId.matches('.*__' + currentUserEmail() + '__.*');
+    }
+
     match /public/connectivity {
       allow read, write: if true;
     }

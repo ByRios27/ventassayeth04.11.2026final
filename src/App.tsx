@@ -30,6 +30,8 @@ import {
   updatePassword,
   runTransaction
 } from './firebase';
+import { setReadMeterContext } from './readMeter';
+import { startReadMeterSync } from './firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 import type { Transaction } from 'firebase/firestore';
 import type { User } from 'firebase/auth';
@@ -1608,7 +1610,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
           </button>
           <button 
             onClick={() => compartirTicket()}
-            className="col-span-2 flex items-center justify-center gap-2 bg-blue-600 text-white py-3 rounded-lg font-bold text-xs uppercase hover:bg-blue-700 transition-colors"
+            className="col-span-2 flex items-center justify-center gap-2 bg-violet-600 text-white py-3 rounded-lg font-bold text-xs uppercase hover:bg-violet-700 transition-colors"
           >
             <Share2 className="w-4 h-4" /> Compartir
           </button>
@@ -3985,6 +3987,12 @@ function App() {
   const [lotteries, setLotteries] = useState<Lottery[]>([]);
   const [results, setResults] = useState<LotteryResult[]>([]);
   const [activeTab, setActiveTab] = useState<'sales' | 'history' | 'admin' | 'dashboard' | 'results' | 'users' | 'liquidaciones' | 'config' | 'archivo' | 'stats' | 'cierres' | 'recovery'>('history');
+  useEffect(() => {
+    setReadMeterContext(activeTab, userProfile?.role);
+  }, [activeTab, userProfile?.role]);
+  useEffect(() => {
+    if (userProfile?.email) startReadMeterSync(userProfile.email);
+  }, [userProfile?.email]);
   const canAccessManagedUsersData = (canUseGlobalScope && (activeTab === 'users' || activeTab === 'liquidaciones' || activeTab === 'archivo' || activeTab === 'recovery'))
     || (activeTab === 'dashboard' && (canUseGlobalScope || userProfile?.role === 'admin'));
   const canViewOtherSellersHistory = userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador';
@@ -6174,16 +6182,25 @@ function App() {
 
   useEffect(() => {
     if (betType === 'BL') {
-      const supportsBL = isMultipleMode 
+      const supportsBL = globalSettings.billetesEnabled && (isMultipleMode 
         ? multiLottery.some(name => { const l = findActiveLotteryByName(name); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); })
-        : (() => { const l = findActiveLotteryByName(selectedLottery); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); })();
+        : (() => { const l = findActiveLotteryByName(selectedLottery); return lotteryAllowsBillete(l) && !!l && isBilleteOpenForSales(l); })());
       
       if (!supportsBL) {
         setBetType('CH');
         setNumber('');
       }
+    } else if (betType === 'PL') {
+      const supportsPL = globalSettings.palesEnabled && (isMultipleMode
+        ? multiLottery.some(name => lotteryAllowsPale(findActiveLotteryByName(name)))
+        : lotteryAllowsPale(findActiveLotteryByName(selectedLottery)));
+
+      if (!supportsPL) {
+        setBetType('CH');
+        setNumber('');
+      }
     }
-  }, [betType, findActiveLotteryByName, isMultipleMode, multiLottery, selectedLottery, tick]);
+  }, [betType, findActiveLotteryByName, globalSettings.billetesEnabled, globalSettings.palesEnabled, isMultipleMode, multiLottery, selectedLottery, tick]);
 
   const cancelTicket = async (id: string) => {
     const ticket = tickets.find(t => t.id === id);
@@ -8709,7 +8726,9 @@ function App() {
           const accepted: Bet[] = [];
           bets.forEach(b => {
             const working = [...cart, ...accepted];
+            if (b.type === 'PL' && (!globalSettings.palesEnabled || !lotteryAllowsPale(findActiveLotteryByName(b.lottery)))) return;
             if (b.type === 'BL') {
+              if (!globalSettings.billetesEnabled) return;
               if (!lotteryAllowsBillete(findActiveLotteryByName(b.lottery)) || !isBilleteOpenForSales(findActiveLotteryByName(b.lottery))) return;
               if (!validateComboUnitCost('BL', b.amount)) return;
             }
@@ -8947,7 +8966,7 @@ function App() {
       {/* Main Content */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden relative min-w-0">
         {/* Top Header */}
-        <header className="sticky top-0 z-40 h-16 glass border-b border-border px-3 flex items-center justify-between shrink-0 gap-2">
+        <header className="app-header sticky top-0 z-40 h-16 glass border-b border-border px-3 flex items-center justify-between shrink-0 gap-2">
           <button 
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
             className="p-2 hover:bg-white/5 rounded-lg text-muted-foreground shrink-0"
@@ -8991,7 +9010,7 @@ function App() {
         </header>
 
         {/* Scrollable Area */}
-        <main className="flex-1 overflow-y-auto overflow-x-hidden p-4 pb-24 md:p-8 md:pb-8 custom-scrollbar min-w-0">
+        <main className="app-main flex-1 overflow-y-auto overflow-x-hidden p-4 pb-24 md:p-8 md:pb-8 custom-scrollbar min-w-0">
           <AnimatePresence mode="wait">
             {activeTab === 'dashboard' && userProfile?.role !== 'seller' && (
               <motion.div
@@ -9968,7 +9987,7 @@ function App() {
                           return (
                             <div key={lotteryName} className={`overflow-hidden rounded-[1.2rem] border transition-all duration-300 ${
                               isExpanded
-                                ? 'border-primary/40 bg-card shadow-[0_0_18px_rgba(59,130,246,0.12)]'
+                                ? 'border-primary/40 bg-card shadow-[0_0_18px_rgba(124,58,237,0.16)]'
                                 : 'border-white/10 bg-card'
                             }`}>
                               <button
@@ -10011,7 +10030,7 @@ function App() {
                                     <div className="mx-auto grid max-w-sm grid-cols-3 gap-1.5 pt-2.5">
                                       {[
                                         { label: '1ro', value: lotteryResult.firstPrize, tone: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-300' },
-                                        { label: '2do', value: lotteryResult.secondPrize, tone: 'border-blue-500/30 bg-blue-500/10 text-blue-300' },
+                                        { label: '2do', value: lotteryResult.secondPrize, tone: 'border-violet-500/30 bg-violet-500/10 text-violet-300' },
                                         { label: '3ro', value: lotteryResult.thirdPrize, tone: 'border-orange-500/30 bg-orange-500/10 text-orange-300' }
                                       ].map(prize => (
                                         <div key={prize.label} className={`flex min-w-0 flex-col items-center justify-center rounded-lg border p-1.5 ${prize.tone}`}>
@@ -10345,7 +10364,7 @@ function App() {
                 exit={{ opacity: 0, y: -20 }}
                 className="space-y-4"
               >
-                <div className="relative overflow-hidden rounded-2xl border border-primary/30 bg-gradient-to-br from-blue-950 via-slate-950 to-indigo-950 p-4 shadow-lg shadow-blue-950/30 md:p-6">
+                <div className="relative overflow-hidden rounded-2xl border border-primary/30 bg-gradient-to-br from-violet-950 via-slate-950 to-purple-950 p-4 shadow-lg shadow-violet-950/30 md:p-6">
                   <div className="pointer-events-none absolute -right-6 -top-10 h-36 w-36 rounded-full bg-primary/20 blur-3xl" />
                   <div className="relative flex items-center gap-3">
                     <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-primary/30 bg-primary/15 text-primary shadow-inner shadow-primary/10">
@@ -10353,7 +10372,7 @@ function App() {
                     </div>
                     <div>
                       <h2 className="text-xl font-black tracking-tight text-white uppercase md:text-3xl">Resultados de Sorteos</h2>
-                      <p className="mt-1 text-[10px] font-bold uppercase tracking-wider text-blue-200/80 md:text-xs">
+                      <p className="mt-1 text-[10px] font-bold uppercase tracking-wider text-violet-200/80 md:text-xs">
                         {canManageResults ? 'Ingreso y control de resultados en tiempo real' : 'Últimos resultados publicados'}
                       </p>
                     </div>
@@ -10380,7 +10399,7 @@ function App() {
                       <div className="grid grid-cols-3 gap-2">
                         {([
                           [resultFormFirstPrize, setResultFormFirstPrize, '1er', 'border-yellow-400/50 bg-yellow-500/20 text-yellow-200'],
-                          [resultFormSecondPrize, setResultFormSecondPrize, '2do', 'border-blue-400/50 bg-blue-500/20 text-blue-200'],
+                          [resultFormSecondPrize, setResultFormSecondPrize, '2do', 'border-violet-400/50 bg-violet-500/20 text-violet-200'],
                           [resultFormThirdPrize, setResultFormThirdPrize, '3er', 'border-orange-400/50 bg-orange-500/20 text-orange-200']
                         ] as const).map(([value, setValue, label, tone]) => (
                           <div key={label} className="flex flex-col items-center gap-1">
@@ -10444,7 +10463,7 @@ function App() {
                         ? 'border-red-400/60 bg-gradient-to-br from-red-950/90 via-red-950/50 to-slate-950 shadow-lg shadow-red-950/30'
                         : statusTone === 'winner'
                           ? 'border-emerald-400/60 bg-gradient-to-br from-emerald-950/90 via-emerald-950/45 to-slate-950 shadow-lg shadow-emerald-950/30'
-                          : 'border-blue-400/30 bg-gradient-to-br from-blue-950/70 via-slate-900 to-indigo-950/60 shadow-md shadow-blue-950/20';
+                          : 'border-violet-400/30 bg-gradient-to-br from-violet-950/70 via-slate-900 to-purple-950/60 shadow-md shadow-violet-950/20';
                       const lotteryInfo = lotteryById.get(res.lotteryId);
 
                       return (
@@ -10494,7 +10513,7 @@ function App() {
 
                           <div className="mt-1.5 flex gap-1.5">
                             <div className="flex h-8 min-w-10 items-center justify-center rounded-lg border border-amber-300/50 bg-gradient-to-br from-amber-400/30 to-yellow-700/20 px-2 text-sm font-black text-amber-100">{res.firstPrize}</div>
-                            <div className="flex h-8 min-w-10 items-center justify-center rounded-lg border border-sky-300/50 bg-gradient-to-br from-sky-400/30 to-blue-700/20 px-2 text-sm font-black text-sky-100">{res.secondPrize}</div>
+                            <div className="flex h-8 min-w-10 items-center justify-center rounded-lg border border-violet-300/50 bg-gradient-to-br from-violet-400/30 to-violet-700/20 px-2 text-sm font-black text-violet-100">{res.secondPrize}</div>
                             <div className="flex h-8 min-w-10 items-center justify-center rounded-lg border border-orange-300/50 bg-gradient-to-br from-orange-400/30 to-rose-700/20 px-2 text-sm font-black text-orange-100">{res.thirdPrize}</div>
                           </div>
 
@@ -10820,7 +10839,7 @@ function App() {
                   <span className="min-w-0 truncate text-[10px] font-black uppercase text-white">{label}</span>
                   {metric(row.sales, 'text-white')}
                   {metric(row.prizes, 'text-rose-300')}
-                  {metric(row.commission, 'text-blue-300')}
+                  {metric(row.commission, 'text-violet-300')}
                   {metric(row.utility, row.utility >= 0 ? 'text-emerald-300' : 'text-rose-300')}
                 </div>
               );
@@ -10927,7 +10946,7 @@ function App() {
                         </div>
                         <div className="flex items-center justify-between border-t border-white/5 py-2.5">
                           <span className="text-xs font-bold text-slate-300">Comisión ({commissionPct.toFixed(2)}%)</span>
-                          <span className="text-sm font-black text-blue-300">-${(report?.totals.commission ?? 0).toFixed(2)}</span>
+                          <span className="text-sm font-black text-violet-300">-${(report?.totals.commission ?? 0).toFixed(2)}</span>
                         </div>
                       </div>
 

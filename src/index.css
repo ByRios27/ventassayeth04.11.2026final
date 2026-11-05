@@ -8,23 +8,23 @@
   
   --color-background: #000000;
   --color-foreground: #ffffff;
-  --color-card: #111827;
+  --color-card: #0d0c18;
   --color-card-foreground: #ffffff;
-  --color-popover: #111827;
+  --color-popover: #0d0c18;
   --color-popover-foreground: #ffffff;
-  --color-primary: #3b82f6;
+  --color-primary: #7c3aed;
   --color-primary-foreground: #ffffff;
-  --color-secondary: #1F2937;
+  --color-secondary: #1b1a2b;
   --color-secondary-foreground: #ffffff;
-  --color-muted: #1F2937;
+  --color-muted: #1b1a2b;
   --color-muted-foreground: #9CA3AF;
-  --color-accent: #1F2937;
+  --color-accent: #1b1a2b;
   --color-accent-foreground: #ffffff;
   --color-destructive: #ef4444;
   --color-destructive-foreground: #ffffff;
-  --color-border: #1F2937;
-  --color-input: #1F2937;
-  --color-ring: #3B82F6;
+  --color-border: #1f1d33;
+  --color-input: #1b1a2b;
+  --color-ring: #7c3aed;
   
   --radius-lg: 0.5rem;
   --radius-md: calc(0.5rem - 2px);
@@ -68,5 +68,28 @@
   }
   .animate-blink {
     animation: blink 1s step-end infinite;
+  }
+}
+
+/* Modo app (PWA instalada o APK): más compacto y sin comportamientos de página web. */
+html.app-compact {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+html.app-compact body {
+  user-select: none;
+  -webkit-user-select: none;
+}
+html.app-compact input,
+html.app-compact textarea,
+html.app-compact select {
+  user-select: text;
+  -webkit-user-select: text;
+}
+@media (max-width: 767px) {
+  html.app-compact { font-size: 15px; }
+  html.app-compact .app-header { height: 3.25rem; }
+  html.app-compact .app-main {
+    padding: 0.625rem 0.625rem calc(5rem + env(safe-area-inset-bottom));
   }
 }

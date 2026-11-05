@@ -15,6 +15,9 @@ export default defineConfig(({mode}) => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    build: {
+      sourcemap: true,
+    },
     server: {
       host: true,
       port: 3000,

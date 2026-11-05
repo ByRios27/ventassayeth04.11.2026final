@@ -9,14 +9,14 @@ import {
   setDoc,
   query, 
   where, 
-  onSnapshot, 
+  onSnapshot as rawOnSnapshot, 
   orderBy, 
   serverTimestamp, 
   doc, 
-  getDoc,
+  getDoc as rawGetDoc,
   updateDoc, 
   deleteDoc,
-  getDocs,
+  getDocs as rawGetDocs,
   writeBatch,
   getDocFromServer,
   documentId,
@@ -25,6 +25,7 @@ import {
   runTransaction,
   connectFirestoreEmulator
 } from "firebase/firestore";
+import { recordListenerOpen, recordListenerSnap, recordListenerClose, recordOneShot, describeTarget, readCallSite, hasUnsentReadMeterChanges, markReadMeterSent, getReadMeterPayload } from './readMeter';
 import { 
   getAuth, 
   GoogleAuthProvider,
@@ -106,20 +107,90 @@ if (useEmulators) {
   }
 }
 
+// Etiqueta de origen para el medidor: ruta de la colección consultada.
+const sourceOf = (target: any, snap?: any): string => {
+  try {
+    const path = target?._query?.path?.canonicalString?.() ?? target?.path;
+    if (path) return String(path).split('/').filter((_, i) => i % 2 === 0).join('/');
+    const first = snap?.docs?.[0] ?? snap;
+    if (first?.ref?.parent?.id) return first.ref.parent.id;
+  } catch {
+    // Etiqueta desconocida.
+  }
+  return 'desconocido';
+};
+
+export const onSnapshot: typeof rawOnSnapshot = ((target: any, ...args: any[]) => {
+  const source = sourceOf(target);
+  const lid = recordListenerOpen(source, describeTarget(target), readCallSite());
+  const wrap = (cb: any) => (snap: any) => {
+    const fromCache = !!snap?.metadata?.fromCache;
+    const docs = typeof snap?.docChanges === 'function'
+      ? snap.docChanges().length
+      : (snap?.exists?.() ? 1 : 0);
+    recordListenerSnap(lid, source, docs, fromCache);
+    return cb(snap);
+  };
+  const cbIndex = args.findIndex(a => typeof a === 'function');
+  if (cbIndex >= 0) args[cbIndex] = wrap(args[cbIndex]);
+  const unsubscribe = (rawOnSnapshot as any)(target, ...args);
+  return () => {
+    recordListenerClose(lid, source);
+    unsubscribe();
+  };
+}) as any;
+
+export const getDocs: typeof rawGetDocs = (async (q: any) => {
+  const site = readCallSite();
+  const started = Date.now();
+  const snap = await rawGetDocs(q);
+  recordOneShot('getDocs', sourceOf(q, snap), describeTarget(q), snap.size, !!snap.metadata?.fromCache, Date.now() - started, site);
+  return snap;
+}) as any;
+
+export const getDoc: typeof rawGetDoc = (async (ref: any) => {
+  const site = readCallSite();
+  const started = Date.now();
+  const snap = await rawGetDoc(ref);
+  recordOneShot('getDoc', sourceOf(ref), String(ref?.path ?? ''), snap.exists() ? 1 : 0, !!snap.metadata?.fromCache, Date.now() - started, site);
+  return snap;
+}) as any;
+let readMeterSyncTimer: ReturnType<typeof setInterval> | null = null;
+let readMeterSyncEmail = '';
+
+// Envía el registro del día a read_meter (solo escritura) cada 20 min si hubo cambios y al ocultar la app.
+export const startReadMeterSync = (email: string) => {
+  const clean = (email || '').trim().toLowerCase();
+  if (!clean || useEmulators || readMeterSyncEmail === clean) return;
+  readMeterSyncEmail = clean;
+  const send = async () => {
+    if (!auth.currentUser || !hasUnsentReadMeterChanges()) return;
+    const payload = getReadMeterPayload();
+    try {
+      await setDoc(doc(db, 'read_meter', `${payload.date}__${clean}__${payload.device}`), { ...payload, email: clean });
+      markReadMeterSent();
+    } catch {
+      // Se reintenta en el siguiente ciclo.
+    }
+  };
+  if (readMeterSyncTimer) clearInterval(readMeterSyncTimer);
+  readMeterSyncTimer = setInterval(send, 20 * 60 * 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void send();
+  });
+};
+
 export {
   collection, 
   addDoc, 
   setDoc,
   query, 
   where, 
-  onSnapshot, 
   orderBy, 
   serverTimestamp, 
   doc, 
-  getDoc,
   updateDoc, 
   deleteDoc,
-  getDocs,
   writeBatch,
   getDocFromServer,
   documentId,
