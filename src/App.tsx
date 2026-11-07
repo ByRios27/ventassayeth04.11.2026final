@@ -258,6 +258,11 @@ interface GlobalSettings {
   };
 }
 
+interface PaleSimulationSettings {
+  enabled: boolean;
+  multiplier: number | null;
+}
+
 interface LotteryResult {
   id: string;
   lotteryId: string;
@@ -268,6 +273,125 @@ interface LotteryResult {
   thirdPrize: string;
   timestamp: any;
 }
+
+interface BetPrizeHit {
+  prize: number;
+  rank: number;
+  winningNumber: string;
+  matchType?: string;
+}
+
+// Un multiplicador en 0 significa "no premia"; solo se usa el valor por defecto si no está configurado.
+const prizeMultiplier = (value: unknown, fallback: number) => {
+  const n = typeof value === 'number' ? value : parseFloat(String(value));
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+// Calcula los premios de una jugada leyendo los multiplicadores de la configuración global.
+const evaluateBetPrizes = (bet: { type: string; number: string; amount?: number; quantity?: number }, result: LotteryResult, settings: GlobalSettings): BetPrizeHit[] => {
+  const hits: BetPrizeHit[] = [];
+  const amount = bet.amount || 0;
+  const number = bet.number || '';
+  const add = (prize: number, rank: number, winningNumber: string, matchType?: string) => {
+    if (prize > 0) hits.push({ prize, rank, winningNumber, matchType });
+  };
+
+  if (bet.type === 'CH') {
+    const quantity = bet.quantity || 1;
+    const pricePerChance = amount / quantity;
+    const config = settings.chancePrices?.find(cp => Math.abs(cp.price - pricePerChance) < 0.001);
+    if (!config) return hits;
+    const last2 = number.slice(-2);
+    ([
+      [result.firstPrize, config.ch1, 1],
+      [result.secondPrize, config.ch2, 2],
+      [result.thirdPrize, config.ch3, 3]
+    ] as [string, number, number][]).forEach(([winning, mult, rank]) => {
+      if (winning && last2 === winning.slice(-2)) add(prizeMultiplier(mult, 0) * quantity, rank, winning);
+    });
+  } else if (bet.type === 'PL' && settings.palesEnabled) {
+    const n1 = number.slice(0, 2);
+    const n2 = number.slice(2, 4);
+    const r1 = (result.firstPrize || '').slice(-2);
+    const r2 = (result.secondPrize || '').slice(-2);
+    const r3 = (result.thirdPrize || '').slice(-2);
+    const pairs: [string, string, number, number][] = [
+      [r1, r2, prizeMultiplier(settings.pl12Multiplier, 1000), 1],
+      [r1, r3, prizeMultiplier(settings.pl13Multiplier, 1000), 1],
+      [r2, r3, prizeMultiplier(settings.pl23Multiplier, 200), 2]
+    ];
+    // Un palé paga una sola combinación: la de mayor multiplicador entre las que acierta.
+    let best: [string, string, number, number] | null = null;
+    pairs.forEach(pair => {
+      const [a, b] = pair;
+      if (a && b && ((n1 === a && n2 === b) || (n1 === b && n2 === a)) && (!best || pair[2] > best[2])) best = pair;
+    });
+    if (best) {
+      const [a, b, mult, rank] = best as [string, string, number, number];
+      add(amount * mult, rank, `${a}-${b}`, 'Palé');
+    }
+  } else if (bet.type === 'BL' && settings.billetesEnabled) {
+    const defaults: BilletePrizeMultipliers = { full4: 2000, first3: 200, last3: 200, first2: 20, last2: 20 };
+    const tables = settings.billeteMultipliers;
+    ([
+      [result.firstPrize, 1, tables?.p1],
+      [result.secondPrize, 2, tables?.p2],
+      [result.thirdPrize, 3, tables?.p3]
+    ] as [string, number, BilletePrizeMultipliers | undefined][]).forEach(([winning, rank, table]) => {
+      if (!winning || winning.length !== 4 || number.length !== 4) return;
+      const m = (key: 'full4' | 'first3' | 'last3' | 'first2' | 'last2') => prizeMultiplier(table?.[key], defaults[key]);
+      // Se paga solo el mayor acierto, en orden: 4 cifras, 3 primeras/últimas, 2 primeras/últimas.
+      const tiers: [boolean, number, string][] = [
+        [number === winning, m('full4'), '4 Cifras'],
+        [number.slice(0, 3) === winning.slice(0, 3), m('first3'), '3 Primeras'],
+        [number.slice(1) === winning.slice(1), m('last3'), '3 últimas'],
+        [number.slice(0, 2) === winning.slice(0, 2), m('first2'), '2 Primeras'],
+        [number.slice(2) === winning.slice(2), m('last2'), '2 últimas']
+      ];
+      const matched = tiers.find(t => t[0]);
+      let payout = matched ? matched[1] : 0;
+      let matchType = matched ? matched[2] : undefined;
+      const last1 = prizeMultiplier(table?.last1, 0);
+      if (last1 > payout && number.charAt(3) === winning.charAt(3)) {
+        payout = last1;
+        matchType = 'Última cifra';
+      }
+      add(amount * payout, rank, winning, matchType);
+    });
+  }
+
+  return hits;
+};
+
+const getPale13Simulation = (
+  bet: { type: string; number: string; amount?: number },
+  result: LotteryResult | undefined,
+  settings: GlobalSettings,
+  simulation: PaleSimulationSettings | undefined
+): { prize: number | null } | null => {
+  const multiplier = simulation?.multiplier;
+  if (
+    !simulation?.enabled ||
+    !settings.palesEnabled ||
+    prizeMultiplier(settings.pl13Multiplier, 1000) !== 0 ||
+    bet.type !== 'PL' ||
+    bet.number?.length !== 4 ||
+    !result
+  ) return null;
+
+  const first = (result.firstPrize || '').slice(-2);
+  const third = (result.thirdPrize || '').slice(-2);
+  if (first.length !== 2 || third.length !== 2) return null;
+  if (!(
+    (bet.number.slice(0, 2) === first && bet.number.slice(2, 4) === third) ||
+    (bet.number.slice(0, 2) === third && bet.number.slice(2, 4) === first)
+  )) return null;
+
+  const prize = typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0
+    ? (bet.amount || 0) * multiplier
+    : null;
+  return { prize };
+};
 
 interface UserProfile {
   email: string;
@@ -749,9 +873,10 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 
 // --- Components ---
 
-const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClose, selectedLotteryName }: { ticket: LotteryTicket, results: LotteryResult[], lotteries: Lottery[], globalSettings: GlobalSettings, users: UserProfile[], onClose: () => void, selectedLotteryName?: string }) => {
+const TicketModal = ({ ticket, results, lotteries, globalSettings, users, canViewPaleSimulation = false, paleSimulationSettings, onClose, selectedLotteryName }: { ticket: LotteryTicket, results: LotteryResult[], lotteries: Lottery[], globalSettings: GlobalSettings, users: UserProfile[], canViewPaleSimulation?: boolean, paleSimulationSettings?: PaleSimulationSettings, onClose: () => void, selectedLotteryName?: string }) => {
   const ticketRef = useRef<HTMLDivElement>(null);
   const [showFullTicket, setShowFullTicket] = useState(!selectedLotteryName);
+  const [isPreparingShare, setIsPreparingShare] = useState(false);
 
   const localTotalAmount = (!showFullTicket && selectedLotteryName)
     ? (ticket.bets || []).filter(b => b.lottery === selectedLotteryName).reduce((sum, b) => sum + (b.amount || 0), 0)
@@ -783,121 +908,10 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
       const result = results.find(r => cleanText(r.lotteryName) === cleanText(bet.lottery) && r.date === ticketDate);
       if (!result) return;
 
-      const last2 = bet.number.slice(-2);
-      
-      if (bet.type === 'CH') {
-        const quantity = bet.quantity || 1;
-        const pricePerChance = (bet.amount || 0) / quantity;
-        
-        const priceConfig = globalSettings.chancePrices?.find(cp => Math.abs(cp.price - pricePerChance) < 0.001);
-        
-        if (last2 === result.firstPrize.slice(-2)) {
-          const mult = priceConfig ? priceConfig.ch1 : 0;
-          const p = mult * quantity;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 1, lotteryName: bet.lottery, winningNumber: result.firstPrize });
-        }
-        
-        if (result.secondPrize && last2 === result.secondPrize.slice(-2)) {
-          const mult = priceConfig ? priceConfig.ch2 : 0;
-          const p = mult * quantity;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 2, lotteryName: bet.lottery, winningNumber: result.secondPrize });
-        }
-        
-        if (result.thirdPrize && last2 === result.thirdPrize.slice(-2)) {
-          const mult = priceConfig ? priceConfig.ch3 : 0;
-          const p = mult * quantity;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 3, lotteryName: bet.lottery, winningNumber: result.thirdPrize });
-        }
-      } else if (bet.type === 'PL' && globalSettings.palesEnabled) {
-        // Pale: Wins if it matches combinations of the three prizes in any order
-        const n1 = bet.number.slice(0, 2);
-        const n2 = bet.number.slice(2, 4);
-        const r1 = result.firstPrize.slice(-2);
-        const r2 = result.secondPrize.slice(-2);
-        const r3 = result.thirdPrize.slice(-2);
-
-        // 1st and 2nd
-        if ((n1 === r1 && n2 === r2) || (n1 === r2 && n2 === r1)) {
-          const mult = globalSettings.pl12Multiplier || 1000;
-          const p = (bet.amount || 0) * mult;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 1, lotteryName: bet.lottery, winningNumber: r1 + '-' + r2, matchType: 'Palé' });
-        }
-        // 1st and 3rd
-        if ((n1 === r1 && n2 === r3) || (n1 === r3 && n2 === r1)) {
-          const mult = globalSettings.pl13Multiplier || 1000;
-          const p = (bet.amount || 0) * mult;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 1, lotteryName: bet.lottery, winningNumber: r1 + '-' + r3, matchType: 'Palé' });
-        }
-        // 2nd and 3rd
-        if ((n1 === r2 && n2 === r3) || (n1 === r3 && n2 === r2)) {
-          const mult = globalSettings.pl23Multiplier || 200;
-          const p = (bet.amount || 0) * mult;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 2, lotteryName: bet.lottery, winningNumber: r2 + '-' + r3, matchType: 'Palé' });
-        }
-      } else if (bet.type === 'BL' && globalSettings.billetesEnabled) {
-        // Billete: 4 digits. Check against first, second, and third prizes
-        const defaultPrizes = { full4: 2000, first3: 200, last3: 200, first2: 20, last2: 20 };
-        const multipliers = globalSettings.billeteMultipliers || {
-          p1: { ...defaultPrizes },
-          p2: { ...defaultPrizes },
-          p3: { ...defaultPrizes }
-        };
-
-        const checkPrize = (winningNum: string, prizeRank: number) => {
-          if (winningNum.length !== 4) return;
-          
-          const pKey = `p${prizeRank}` as keyof typeof multipliers;
-          const prizeMults = multipliers[pKey] || defaultPrizes;
-          const betNum = bet.number;
-          const amount = bet.amount || 0;
-
-          // Full 4 digits
-          if (betNum === winningNum) {
-            const p = amount * prizeMults.full4;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '4 Cifras' });
-            return; // If full match, don't count partials for the same prize
-          }
-
-          // First 3 digits
-          if (betNum.slice(0, 3) === winningNum.slice(0, 3)) {
-            const p = amount * prizeMults.first3;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '3 Primeras' });
-          } else if (betNum.slice(0, 2) === winningNum.slice(0, 2)) {
-            // First 2 digits
-            const p = amount * prizeMults.first2;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '2 Primeras' });
-          }
-
-          // Last 3 digits
-          if (betNum.slice(1, 4) === winningNum.slice(1, 4)) {
-            const p = amount * prizeMults.last3;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '3 últimas' });
-          } else if (betNum.slice(2, 4) === winningNum.slice(2, 4)) {
-            // Last 2 digits
-            const p = amount * prizeMults.last2;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '2 últimas' });
-          } else if (((prizeMults as BilletePrizeMultipliers).last1 || 0) > 0 && betNum.slice(3) === winningNum.slice(3)) {
-            const p = amount * ((prizeMults as BilletePrizeMultipliers).last1 || 0);
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: 'Última cifra' });
-          }
-        };
-
-        checkPrize(result.firstPrize, 1);
-        checkPrize(result.secondPrize, 2);
-        checkPrize(result.thirdPrize, 3);
-      }
+      evaluateBetPrizes(bet, result, globalSettings).forEach(hit => {
+        totalPrize += hit.prize;
+        winningBets.push({ idx, lotteryName: bet.lottery, ...hit });
+      });
     });
 
     return { totalPrize, winningBets };
@@ -925,6 +939,8 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
     }
 
     try {
+      setIsPreparingShare(true);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       await document.fonts.ready;
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -938,6 +954,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
         backgroundColor: '#ffffff',
         cacheBust: true,
         pixelRatio: 2,
+        filter: element => !(element instanceof HTMLElement && element.dataset.noShare !== undefined),
         style: {
           transform: 'scale(1)',
           transformOrigin: 'top left',
@@ -1024,6 +1041,8 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
       }
       console.error('Error detallado al compartir:', err);
       toast.error(`Error al compartir: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setIsPreparingShare(false);
     }
   };
 
@@ -1379,7 +1398,7 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
       <motion.div 
         initial={{ scale: 0.9, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
-        className="bg-[#0f172a] text-white p-2 rounded-xl shadow-2xl w-full relative max-h-[90vh] overflow-y-auto custom-scrollbar"
+        className="bg-[#0f172a] text-white p-2 rounded-xl shadow-2xl w-full max-w-md relative max-h-[90vh] overflow-y-auto custom-scrollbar"
       >
         {selectedLotteryName && new Set(ticket.bets.map(b => b.lottery)).size > 1 && (
           <div className="p-4 bg-[#1e293b] border-b border-white/10 flex items-center justify-between">
@@ -1499,16 +1518,22 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
                               original &&
                               original.number === bet.number &&
                               original.type === bet.type &&
-                              normalizePlainText(original.lottery || '') === lotteryKey
+                              normalizePlainText(original.lottery || '') === lotteryKey &&
+                              (bet.type !== 'CH' || Math.abs(getBetUnitPrice(original) - getBetUnitPrice(bet)) < 0.001)
                             );
                           });
                           const hasWon = betWinnings.length > 0;
                           const betTotalPrize = betWinnings.reduce((sum, wb) => sum + wb.prize, 0);
+                          const pale13Simulation = canViewPaleSimulation && ticket.status !== 'cancelled'
+                            ? getPale13Simulation(bet, result, globalSettings, paleSimulationSettings)
+                            : null;
+                          const showPale13Simulation = pale13Simulation !== null && !isPreparingShare;
+                          const displayAsWinner = hasWon || showPale13Simulation;
                           
                           return (
-                            <div key={`${lotName}-${bet.type}-${bet.number}-${idx}`} className={`flex justify-between items-center px-1 py-0.5 rounded transition-colors ${hasWon ? 'bg-yellow-50 border border-yellow-200' : 'hover:bg-gray-50'}`}>
+                            <div key={`${lotName}-${bet.type}-${bet.number}-${idx}`} className={`flex justify-between items-center px-1 py-0.5 rounded transition-colors ${displayAsWinner ? 'bg-yellow-50 border border-yellow-200' : 'hover:bg-gray-50'}`}>
                               <div className="flex items-center gap-1.5">
-                                <span className={`text-sm font-bold tracking-tight ${hasWon ? 'text-yellow-700' : ''}`}>
+                                <span className={`text-sm font-bold tracking-tight ${displayAsWinner ? 'text-yellow-700' : ''}`}>
                                   {bet?.type === 'PL' && bet?.number?.length === 4 
                                     ? `${bet.number.slice(0, 2)}-${bet.number.slice(2, 4)}`
                                     : (bet?.number || '??')}
@@ -1516,11 +1541,16 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
                                 <span className="text-[9px] font-mono font-bold text-gray-400 uppercase">
                                   {getBetTypeLabel(bet?.type)}
                                 </span>
+                                {showPale13Simulation && (
+                                  <span data-no-share className="ml-1 text-[8px] font-mono bg-violet-600 text-white px-1 rounded font-bold uppercase leading-tight">
+                                    1º Palé · {pale13Simulation.prize !== null ? `$${pale13Simulation.prize.toFixed(2)}` : '—'}
+                                  </span>
+                                )}
                                 {hasWon && (
                                   <div className="flex flex-wrap gap-0.5 ml-1">
                                     {betWinnings.map((wb, wIdx) => (
-                                      <span key={wIdx} className="text-[6px] font-mono bg-yellow-500 text-black px-1 rounded font-bold uppercase leading-tight">
-                                        {wb.rank}º{wb.matchType ? ` ${wb.matchType}` : ''}
+                                      <span key={wIdx} className="text-[8px] font-mono bg-violet-600 text-white px-1 rounded font-bold uppercase leading-tight">
+                                        {wb.rank}º{wb.matchType ? ` ${wb.matchType}` : ''} · ${wb.prize.toFixed(2)}
                                       </span>
                                     ))}
                                   </div>
@@ -1530,7 +1560,12 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
                                 <div className="flex flex-col items-end">
                                   <span className="text-[10px] font-mono font-medium text-gray-500">{bet.quantity}</span>
                                   {hasWon && (
-                                    <span className="text-[7px] font-black text-yellow-600">USD {betTotalPrize.toFixed(2)}</span>
+                                    <span className="text-[10px] font-black text-violet-700">Premia ${betTotalPrize.toFixed(2)}</span>
+                                  )}
+                                  {showPale13Simulation && (
+                                    <span data-no-share className="text-[10px] font-black text-violet-700">
+                                      Premia {pale13Simulation.prize !== null ? `$${pale13Simulation.prize.toFixed(2)}` : '—'}
+                                    </span>
                                   )}
                                 </div>
                                 <span className="text-xs font-bold font-mono w-12 text-right">
@@ -1556,27 +1591,27 @@ const TicketModal = ({ ticket, results, lotteries, globalSettings, users, onClos
             </div>
 
             {totalPrize > 0 && (
-              <div className="mt-4 p-4 bg-yellow-400 rounded-xl flex justify-between items-center shadow-lg shadow-yellow-400/20 border-2 border-yellow-500">
+              <div className="mt-4 p-4 bg-gradient-to-br from-violet-600 to-purple-800 rounded-xl flex justify-between items-center shadow-lg shadow-violet-700/30 border-2 border-violet-400">
                 <div className="flex items-center gap-2">
-                  <div className="bg-black text-yellow-400 p-1 rounded-full">
+                  <div className="bg-white text-violet-700 p-1 rounded-full">
                     <DollarSign className="w-4 h-4" />
                   </div>
-                  <span className="text-sm font-black uppercase tracking-tighter text-black">PREMIO TOTAL</span>
+                  <span className="text-sm font-black uppercase tracking-tighter text-white">PREMIO TOTAL</span>
                 </div>
-                <span className="text-2xl font-black text-black tracking-tighter">
+                <span className="text-2xl font-black text-white tracking-tighter">
                   USD {totalPrize.toFixed(2)}
                 </span>
               </div>
             )}
 
             {/* Total Footer */}
-            <div className="mt-8 pt-6 border-t-2 border-gray-100 text-black">
+            <div className="mt-6 p-4 rounded-xl bg-gradient-to-br from-violet-600 to-purple-800 border-2 border-violet-400 shadow-lg shadow-violet-700/30 text-white">
               <div className="flex justify-between items-end">
                 <div className="flex flex-col">
-                  <span className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-1">Total a Pagar</span>
-                  <span className="text-[10px] font-mono text-gray-400">Moneda: USD</span>
+                  <span className="text-xs font-bold uppercase tracking-widest text-violet-200 mb-1">Total a Pagar</span>
+                  <span className="text-[10px] font-mono text-violet-200">Moneda: USD</span>
                 </div>
-                <span className="text-4xl font-bold tracking-tighter leading-none">
+                <span className="text-4xl font-bold tracking-tighter leading-none text-white">
                   ${localTotalAmount.toFixed(2)}
                 </span>
               </div>
@@ -3998,6 +4033,9 @@ function App() {
   const canViewOtherSellersHistory = userProfile?.role === 'ceo' || userProfile?.role === 'admin' || userProfile?.role === 'programador';
   const historyViewingOtherSeller = activeTab === 'history' && canViewOtherSellersHistory && !!historySellerEmail;
   const canAccessAllUsers = canAccessManagedUsersData || historyViewingOtherSeller || (canUseGlobalScope && showGlobalScope && (activeTab === 'stats' || activeTab === 'cierres'));
+  const isGlobalTicketFeedView = ['ceo', 'admin', 'programador'].includes(userProfile?.role || '')
+    && ['dashboard', 'stats', 'cierres'].includes(activeTab);
+  const ticketFeedIsGlobal = canAccessAllUsers || isGlobalTicketFeedView;
   const [expandedStats, setExpandedStats] = useState<string[]>([]);
   const [statsReportFilter, setStatsReportFilter] = useState<StatsReportFilter>('global');
   const [isGeneratingStatsReport, setIsGeneratingStatsReport] = useState(false);
@@ -4131,6 +4169,7 @@ function App() {
   const liquidationDayCacheRef = useRef<Map<string, { tickets: LotteryTicket[]; results: LotteryResult[] }>>(new Map());
   const primaryCeoEmail = (import.meta.env.VITE_CEO_EMAIL || 'zsayeth09@gmail.com').toLowerCase();
   const isPrimaryCeoUser = (userProfile?.email || '').toLowerCase() === primaryCeoEmail;
+  const canViewPaleSimulation = isPrimaryCeoUser || userProfile?.role === 'programador';
   const historyDataCacheRef = useRef<Map<string, {
     tickets: LotteryTicket[];
     settlements: Settlement[];
@@ -4250,6 +4289,12 @@ function App() {
     pl23Multiplier: 200,
     nextSellerNumber: 2
   });
+  const [paleSimulationSettings, setPaleSimulationSettings] = useState<PaleSimulationSettings>({
+    enabled: false,
+    multiplier: null
+  });
+  const [paleSimulationMultiplierInput, setPaleSimulationMultiplierInput] = useState('');
+  const [isSavingPaleSimulation, setIsSavingPaleSimulation] = useState(false);
   const [configSection, setConfigSection] = useState<'chances' | 'especiales' | 'dispositivos' | 'perfil'>('perfil');
 
   const Cursor = () => <span className="w-[2px] h-6 bg-primary animate-blink inline-block align-middle ml-0.5" />;
@@ -4880,6 +4925,26 @@ function App() {
     };
   }, [user?.uid, userProfile?.role]);
 
+  useEffect(() => {
+      if (!user?.uid || !canViewPaleSimulation) {
+        setPaleSimulationSettings({ enabled: false, multiplier: null });
+        setPaleSimulationMultiplierInput('');
+        return;
+      }
+
+      return onSnapshot(doc(db, 'settings', 'paleSimulation'), (snapshot) => {
+        const data = snapshot.exists() ? snapshot.data() : {};
+        const multiplier = typeof data.multiplier === 'number' && Number.isFinite(data.multiplier) && data.multiplier > 0
+          ? data.multiplier
+          : null;
+        const nextSettings = { enabled: data.enabled === true, multiplier };
+        setPaleSimulationSettings(nextSettings);
+        setPaleSimulationMultiplierInput(multiplier === null ? '' : String(multiplier));
+      }, (error) => {
+        handleFirestoreError(error, OperationType.GET, 'settings/paleSimulation');
+      });
+  }, [canViewPaleSimulation, user?.uid]);
+
   // 2. Stable Real-time Results Feed (operational day)
   useEffect(() => {
     if (!user?.uid || !userProfile?.role) return;
@@ -4899,22 +4964,15 @@ function App() {
     return () => unsubscribeResults();
   }, [businessDayKey, mergeResultsWithLiveFeed, user?.uid, userProfile?.role]);
 
-  // 3. Today's Real-time Data
+  // 3. Today's ticket feed stays shared across dashboard/report views for global-read roles.
   useEffect(() => {
     if (!user?.uid || !userProfile?.role) return;
     if (!needsRealtimeOperationalData) return;
 
-    // Calculate start of current business day (3 AM)
-    const startOfToday = getStartOfBusinessDay();
-
-    // Fetch TODAY'S tickets for active dashboard by business day date.
-    // This ensures tickets with today's date are shown even if timestamp values differ.
     console.log("Fetching today's tickets for user:", user.uid);
 
-    if (canAccessAllUsers) {
-      // Tickets from some clients have no `date` field, so also query by timestamp range.
+    if (ticketFeedIsGlobal) {
       const { start: dayStart, end: dayEnd } = getBusinessDayRange(businessDayKey);
-      // Una sola consulta por rango de timestamp (todos los tickets lo tienen): evita leer dos veces cada ticket.
       const qTodayByTime = query(
         collection(db, 'tickets'),
         where('timestamp', '>=', dayStart),
@@ -4927,32 +4985,17 @@ function App() {
         console.error("Error fetching today's tickets:", error);
         handleFirestoreError(error, OperationType.GET, 'tickets_today');
       });
-      console.log("Fetching settlements for user:", user?.email?.toLowerCase());
-      const qSettlements = query(
-        collection(db, 'settlements'),
-        where('date', '==', businessDayKey),
-        limit(50)
-      );
-      const unsubscribeSettlements = onSnapshot(qSettlements, (snapshot) => {
-        console.log("Settlements fetched successfully:", snapshot.size);
-        const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Settlement));
-        setSettlements(docs);
-      }, (error) => {
-        console.error("Error fetching settlements:", error);
-        handleFirestoreError(error, OperationType.GET, 'settlements');
-      });
-
-      return () => {
-        unsubscribeTickets();
-        unsubscribeSettlements();
-      };
+      return unsubscribeTickets;
     }
 
     const sellerEmail = user.email?.toLowerCase();
+    // Por timestamp del servidor (como el admin y el historial): no depende del campo `date` escrito por el dispositivo.
+    const { start: sellerDayStart, end: sellerDayEnd } = getBusinessDayRange(businessDayKey);
     const qTodayBySeller = query(
       collection(db, 'tickets'),
       where('sellerId', '==', user.uid),
-      where('date', '==', businessDayKey),
+      where('timestamp', '>=', sellerDayStart),
+      where('timestamp', '<', sellerDayEnd),
       limit(2000)
     );
 
@@ -4967,14 +5010,26 @@ function App() {
       handleFirestoreError(error, OperationType.GET, 'tickets_today_by_seller');
     });
 
-    // Fetch settlements (limit to last 100)
+    return unsubscribeTicketsBySeller;
+  }, [businessDayKey, getBusinessDayRange, mergeTicketSnapshots, needsRealtimeOperationalData, ticketFeedIsGlobal, user?.uid, user?.email, userProfile?.role]);
+
+  // Settlements remain scoped to the current view; ticket navigation does not reopen their listener.
+  useEffect(() => {
+    if (!user?.uid || !userProfile?.role || !needsRealtimeOperationalData) return;
+
     console.log("Fetching settlements for user:", user?.email?.toLowerCase());
-    const qSettlements = query(
-      collection(db, 'settlements'),
-      where('userEmail', '==', user?.email?.toLowerCase()),
-      where('date', '==', businessDayKey),
-      limit(20)
-    );
+    const qSettlements = canAccessAllUsers
+      ? query(
+          collection(db, 'settlements'),
+          where('date', '==', businessDayKey),
+          limit(50)
+        )
+      : query(
+          collection(db, 'settlements'),
+          where('userEmail', '==', user.email?.toLowerCase()),
+          where('date', '==', businessDayKey),
+          limit(20)
+        );
     const unsubscribeSettlements = onSnapshot(qSettlements, (snapshot) => {
       console.log("Settlements fetched successfully:", snapshot.size);
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Settlement));
@@ -4984,11 +5039,8 @@ function App() {
       handleFirestoreError(error, OperationType.GET, 'settlements');
     });
 
-    return () => {
-      unsubscribeTicketsBySeller();
-      unsubscribeSettlements();
-    };
-  }, [businessDayKey, canAccessAllUsers, mergeTicketSnapshots, needsRealtimeOperationalData, user?.uid, user?.email, userProfile?.role, userProfile?.canLiquidate]);
+    return unsubscribeSettlements;
+  }, [businessDayKey, canAccessAllUsers, needsRealtimeOperationalData, user?.uid, user?.email, userProfile?.role]);
 
   // 4. History Data (Conditional on Date)
   useEffect(() => {
@@ -5019,7 +5071,14 @@ function App() {
       try {
         if (historyDate === businessDayKey) {
           if (!cancelled) {
-            setHistoryTickets(tickets);
+            const currentUserEmail = user.email?.toLowerCase();
+            const visibleTickets = canAccessAllUsers
+              ? tickets
+              : tickets.filter(ticket => (
+                  ticket.sellerId === user.uid ||
+                  ticket.sellerEmail?.toLowerCase() === currentUserEmail
+                ));
+            setHistoryTickets(visibleTickets);
             setHistorySettlements(settlements.filter(s => s.date === historyDate));
             setHistoryResults(results.filter(r => r.date === historyDate));
           }
@@ -5744,120 +5803,10 @@ function App() {
       const result = resultsSource.find(r => cleanText(r.lotteryName) === cleanText(bet.lottery) && r.date === ticketDate);
       if (!result) return;
 
-      const last2 = bet.number.slice(-2);
-      
-      if (bet.type === 'CH') {
-        const quantity = bet.quantity || 1;
-        const pricePerChance = (bet.amount || 0) / quantity;
-        
-        const priceConfig = globalSettings.chancePrices?.find(cp => Math.abs(cp.price - pricePerChance) < 0.001);
-        
-        if (last2 === result.firstPrize.slice(-2)) {
-          const mult = priceConfig ? priceConfig.ch1 : 0;
-          const p = mult * quantity;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 1, lotteryName: bet.lottery, winningNumber: result.firstPrize });
-        }
-        
-        if (result.secondPrize && last2 === result.secondPrize.slice(-2)) {
-          const mult = priceConfig ? priceConfig.ch2 : 0;
-          const p = mult * quantity;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 2, lotteryName: bet.lottery, winningNumber: result.secondPrize });
-        }
-        
-        if (result.thirdPrize && last2 === result.thirdPrize.slice(-2)) {
-          const mult = priceConfig ? priceConfig.ch3 : 0;
-          const p = mult * quantity;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 3, lotteryName: bet.lottery, winningNumber: result.thirdPrize });
-        }
-      } else if (bet.type === 'PL' && globalSettings.palesEnabled) {
-        const n1 = bet.number.slice(0, 2);
-        const n2 = bet.number.slice(2, 4);
-        const r1 = result.firstPrize.slice(-2);
-        const r2 = result.secondPrize.slice(-2);
-        const r3 = result.thirdPrize.slice(-2);
-
-        // 1st and 2nd
-        if ((n1 === r1 && n2 === r2) || (n1 === r2 && n2 === r1)) {
-          const mult = globalSettings.pl12Multiplier || 1000;
-          const p = (bet.amount || 0) * mult;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 1, lotteryName: bet.lottery, winningNumber: r1 + '-' + r2, matchType: 'Palé' });
-        }
-        // 1st and 3rd
-        if ((n1 === r1 && n2 === r3) || (n1 === r3 && n2 === r1)) {
-          const mult = globalSettings.pl13Multiplier || 1000;
-          const p = (bet.amount || 0) * mult;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 1, lotteryName: bet.lottery, winningNumber: r1 + '-' + r3, matchType: 'Palé' });
-        }
-        // 2nd and 3rd
-        if ((n1 === r2 && n2 === r3) || (n1 === r3 && n2 === r2)) {
-          const mult = globalSettings.pl23Multiplier || 200;
-          const p = (bet.amount || 0) * mult;
-          totalPrize += p;
-          winningBets.push({ idx, prize: p, rank: 2, lotteryName: bet.lottery, winningNumber: r2 + '-' + r3, matchType: 'Palé' });
-        }
-      } else if (bet.type === 'BL' && globalSettings.billetesEnabled) {
-        // Billete: 4 digits. Check against first, second, and third prizes
-        const defaultPrizes = { full4: 2000, first3: 200, last3: 200, first2: 20, last2: 20 };
-        const multipliers = globalSettings.billeteMultipliers || {
-          p1: { ...defaultPrizes },
-          p2: { ...defaultPrizes },
-          p3: { ...defaultPrizes }
-        };
-
-        const checkPrize = (winningNum: string, prizeRank: number) => {
-          if (winningNum.length !== 4) return;
-          
-          const pKey = `p${prizeRank}` as keyof typeof multipliers;
-          const prizeMults = multipliers[pKey] || defaultPrizes;
-          const betNum = bet.number;
-          const amount = bet.amount || 0;
-
-          // Full 4 digits
-          if (betNum === winningNum) {
-            const p = amount * prizeMults.full4;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '4 Cifras' });
-            return; // If full match, don't count partials for the same prize
-          }
-
-          // First 3 digits
-          if (betNum.slice(0, 3) === winningNum.slice(0, 3)) {
-            const p = amount * prizeMults.first3;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '3 Primeras' });
-          } else if (betNum.slice(0, 2) === winningNum.slice(0, 2)) {
-            // First 2 digits
-            const p = amount * prizeMults.first2;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '2 Primeras' });
-          }
-
-          // Last 3 digits
-          if (betNum.slice(1, 4) === winningNum.slice(1, 4)) {
-            const p = amount * prizeMults.last3;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '3 últimas' });
-          } else if (betNum.slice(2, 4) === winningNum.slice(2, 4)) {
-            // Last 2 digits
-            const p = amount * prizeMults.last2;
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: '2 últimas' });
-          } else if (((prizeMults as BilletePrizeMultipliers).last1 || 0) > 0 && betNum.slice(3) === winningNum.slice(3)) {
-            const p = amount * ((prizeMults as BilletePrizeMultipliers).last1 || 0);
-            totalPrize += p;
-            winningBets.push({ idx, prize: p, rank: prizeRank, lotteryName: bet.lottery, winningNumber: winningNum, matchType: 'Última cifra' });
-          }
-        };
-
-        checkPrize(result.firstPrize, 1);
-        checkPrize(result.secondPrize, 2);
-        checkPrize(result.thirdPrize, 3);
-      }
+      evaluateBetPrizes(bet, result, globalSettings).forEach(hit => {
+        totalPrize += hit.prize;
+        winningBets.push({ idx, lotteryName: bet.lottery, ...hit });
+      });
     });
 
     return { totalPrize, winningBets };
@@ -7761,8 +7710,13 @@ function App() {
   const shareDashboard = useCallback(async () => {
     if (!dashboardRef.current) return;
     try {
-      const dataUrl = await toPng(dashboardRef.current, { backgroundColor: '#0a0a0a', cacheBust: true, pixelRatio: 2 });
-      const blob = await (await fetch(dataUrl)).blob();
+      const dataUrl = await toPng(dashboardRef.current,       {
+              backgroundColor: '#0a0a0a',
+              cacheBust: true,
+              pixelRatio: 2,
+              filter: node => !(node instanceof HTMLElement && node.dataset.noShare !== undefined)
+            });
+            const blob = await (await fetch(dataUrl)).blob();
       const file = new File([blob], `negocio-${todayStr}.png`, { type: 'image/png' });
       if (navigator.canShare?.({ files: [file] })) {
         await navigator.share({ files: [file], title: '¿Cómo va el negocio?' });
@@ -7885,7 +7839,7 @@ function App() {
         paginatedTickets
       };
     }).filter((item): item is NonNullable<typeof item> => !!item);
-  }, [activeTab, canAccessAllUsers, filteredTickets, getTicketPrizes, historyDate, historySellerEmail, historyTypeFilterCode, isLotteryOpenForSales, lotteryPages, results, sortedLotteries, user?.email, user?.uid]);
+  }, [activeTab, canAccessAllUsers, canViewPaleSimulation, filteredTickets, getTicketPrizes, globalSettings.palesEnabled, globalSettings.pl13Multiplier, historyDate, historySellerEmail, historyTypeFilterCode, isLotteryOpenForSales, lotteryPages, paleSimulationSettings.enabled, paleSimulationSettings.multiplier, results, sortedLotteries, user?.email, user?.uid]);
 
   const historyStats = useMemo(() => {
     if (activeTab !== 'history') return null;
@@ -8804,6 +8758,8 @@ function App() {
           lotteries={lotteries}
           globalSettings={globalSettings}
           users={users}
+          canViewPaleSimulation={canViewPaleSimulation}
+          paleSimulationSettings={paleSimulationSettings}
           onClose={() => setShowTicketModal(null)} 
         />
       )}
@@ -8875,7 +8831,7 @@ function App() {
           width: isMobile ? (isSidebarOpen ? 280 : 0) : (isSidebarOpen ? 280 : 80),
           x: isMobile && !isSidebarOpen ? -280 : 0
         }}
-        className={`glass border-r border-border h-screen flex flex-col z-[60] ${isMobile ? 'fixed inset-y-0 left-0' : 'relative'}`}
+        className={`glass border-r border-border h-screen flex flex-col ${isMobile ? 'z-[60] fixed inset-y-0 left-0' : 'z-30 relative'}`}
       >
         <div className="p-6 flex items-center gap-3">
           <div className="bg-primary p-2 rounded-lg neon-border">
@@ -9029,6 +8985,7 @@ function App() {
                     </div>
                     <button
                       onClick={shareDashboard}
+                      data-no-share
                       className="flex items-center gap-1.5 px-3 py-2 rounded-xl border border-white/10 bg-white/[0.04]                       text-xs font-extrabold uppercase tracking-wider text-primary"
                     >
                       <Share2 className="w-3.5 h-3.5" /> Compartir
@@ -9090,8 +9047,10 @@ function App() {
                   <div className="glass-card p-3 border-white/5 bg-white/[0.02] text-center text-xs font-extrabold uppercase tracking-wider text-white/70">
                     {dashboardData.userRanking.length} {dashboardData.userRanking.length === 1 ? 'usuario ha vendido' : 'usuarios han vendido'} hoy
                   </div>
+                </div>
 
-                  {([['Ventas por usuario', dashboardData.userRanking], ['Ventas por sorteo', dashboardData.lotteryRanking]] as const).map(([title, rows]) => (
+                <div className="space-y-3 p-1">
+                {([['Ventas por usuario', dashboardData.userRanking], ['Ventas por sorteo', dashboardData.lotteryRanking]] as const).map(([title, rows]) => (
                     <div key={title} className="glass-card p-4 border-white/5 bg-white/[0.02]">
                       <p className="text-xs font-extrabold text-white/70 uppercase tracking-[0.12em] mb-3 text-center">{title}</p>
                       {rows.length === 0 ? (
@@ -9683,9 +9642,16 @@ function App() {
                                 <div className="space-y-3 p-4">
                                   {paginatedTickets.map(({ t: ticket }) => {
                                     const { totalPrize, winningBets } = getTicketPrizes(ticket, lot.name, historyTypeFilterCode);
+                                    const ticketDate = getTicketDateKey(ticket);
+                                    const hasPale13SimulationWin = canViewPaleSimulation
+                                      && ticket.status !== 'cancelled'
+                                      && (ticket.bets || []).some(bet => {
+                                        const result = results.find(r => normalizePlainText(r.lotteryName) === normalizePlainText(bet.lottery) && r.date === ticketDate);
+                                        return getPale13Simulation(bet, result, globalSettings, paleSimulationSettings) !== null;
+                                      });
 
                                     return (
-                                      <div key={ticket.id} className={`glass-card p-2 border-white/5 bg-white/[0.01] hover:bg-white/[0.03] transition-all relative overflow-hidden ${totalPrize > 0 ? 'ring-1 ring-green-500/30' : ''}`}>
+                                      <div key={ticket.id} className={`glass-card p-2 border-white/5 bg-white/[0.01] hover:bg-white/[0.03] transition-all relative overflow-hidden ${totalPrize > 0 || hasPale13SimulationWin ? 'ring-1 ring-green-500/30' : ''}`}>
                                         {/* Header */}
                                         <div className="flex justify-between items-start mb-1">
                                           <div className="space-y-0.5">
@@ -9777,13 +9743,23 @@ function App() {
                                                   normalizePlainText(original.lottery || '') === lotKey
                                                 );
                                               });
+                                              const result = results.find(r => normalizePlainText(r.lotteryName) === lotKey && r.date === ticketDate);
+                                              const pale13Simulation = canViewPaleSimulation && ticket.status !== 'cancelled'
+                                                ? getPale13Simulation(b, result, globalSettings, paleSimulationSettings)
+                                                : null;
+                                              const isDisplayWinner = hasWinningBet || pale13Simulation !== null;
 
                                               return (
-                                                <div key={`${ticket.id}-${lot.id}-${b.type}-${b.number}-${i}`} className={`flex justify-center items-center px-1.5 py-1 rounded border transition-all ${hasWinningBet ? 'border-green-500/50 bg-green-500/20' : 'border-white/5 bg-black/40'}`}>
+                                                <div key={`${ticket.id}-${lot.id}-${b.type}-${b.number}-${i}`} className={`flex flex-col justify-center items-center px-1.5 py-1 rounded border transition-all ${isDisplayWinner ? 'border-green-500/50 bg-green-500/20' : 'border-white/5 bg-black/40'}`}>
                                                   <div className="flex items-center gap-1">
                                                     <span className="text-xs font-black text-white">{b.number}</span>
                                                     <span className="text-[11px] font-extrabold text-muted-foreground">x{b.quantity}</span>
                                                   </div>
+                                                  {pale13Simulation !== null && (
+                                                    <span className="text-[8px] font-black uppercase leading-tight text-green-300">
+                                                      Win {pale13Simulation.prize !== null ? `$${pale13Simulation.prize.toFixed(2)}` : ''}
+                                                    </span>
+                                                  )}
                                                 </div>
                                               );
                                             });
@@ -9978,6 +9954,17 @@ function App() {
                           const lotteryResult = results.find(result => (
                             cleanText(result.lotteryName) === cleanText(lotteryName) && result.date === historyDate
                           ));
+                          const winningChanceNums = lotteryResult
+                            ? [lotteryResult.firstPrize, lotteryResult.secondPrize, lotteryResult.thirdPrize].map(p => (p || '').slice(-2))
+                            : [];
+                          const winningPositionLabels = ['1er', '2do', '3er'];
+                          const winningPaleKeys = new Set<string>();
+                          if (winningChanceNums.length === 3 && winningChanceNums.every(n => n.length === 2)) {
+                            [[0, 1], [0, 2], [1, 2]].forEach(([a, b]) => {
+                              winningPaleKeys.add(`PL ${winningChanceNums[a]}${winningChanceNums[b]}`);
+                              winningPaleKeys.add(`PL ${winningChanceNums[b]}${winningChanceNums[a]}`);
+                            });
+                          }
                           const visibleBets = bets.filter(bet => (
                             reportFilter === 'global'
                             || (reportFilter === 'chance' && bet.type === 'CH')
@@ -9992,7 +9979,7 @@ function App() {
                             }`}>
                               <button
                                 aria-expanded={isExpanded}
-                                onClick={() => setExpandedStats(prev => prev.includes(lotteryName) ? prev.filter(n => n !== lotteryName) : [...prev, lotteryName])}
+                                onClick={() => setExpandedStats(prev => prev.includes(lotteryName) ? [] : [lotteryName])}
                                 className="flex w-full items-center justify-between gap-2 p-2.5 text-left transition-colors hover:bg-white/5 sm:p-3"
                               >
                                 <div className="flex min-w-0 flex-1 items-center gap-1">
@@ -10069,22 +10056,33 @@ function App() {
                                                 const number = index.toString().padStart(2, '0');
                                                 const quantity = chanceTotals.get(number) || 0;
                                                 const isTopSeller = topChanceNumbers.has(number);
+                                                const winIndex = winningChanceNums.indexOf(number);
+                                                const isWinner = winIndex >= 0;
                                                 return (
                                                   <button
                                                     type="button"
                                                     key={number}
                                                     disabled={quantity <= 0}
                                                     onClick={() => openNumberTickets(reportTickets, lotteryName, 'CH', number)}
-                                                    className={`flex min-h-10 flex-col items-center justify-center rounded-md border p-0.5 transition-transform active:scale-95 ${
-                                                      quantity > 0 ? 'border-primary/20 bg-primary/10' : 'border-white/5 bg-black/40'
+                                                    className={`relative flex min-h-10 flex-col items-center justify-center rounded-md border p-0.5 transition-transform active:scale-95 ${
+                                                      isWinner && quantity > 0
+                                                        ? 'z-10 border-white bg-emerald-600/95 ring-2 ring-white shadow-[0_0_8px_rgba(74,222,128,0.9)]'
+                                                        : isWinner
+                                                          ? 'border-yellow-300/80 bg-black/40 ring-1 ring-yellow-300/80 disabled:opacity-100'
+                                                          : quantity > 0 ? 'border-primary/20 bg-primary/10' : 'border-white/5 bg-black/40'
                                                     }`}
                                                   >
-                                                    <span className="text-[9px] font-semibold leading-none text-muted-foreground">{number}</span>
+                                                    <span className={`text-[9px] font-semibold leading-none ${isWinner && quantity > 0 ? 'text-white/90' : 'text-muted-foreground'}`}>{number}</span>
                                                     <span className={`mt-1 text-xs font-black leading-none ${
-                                                      isTopSeller ? 'text-red-500' : quantity > 0 ? 'text-white' : 'text-white/20'
+                                                      isWinner && quantity > 0 ? 'text-white' : isTopSeller ? 'text-red-500' : quantity > 0 ? 'text-white' : 'text-white/20'
                                                     }`}>
                                                       {quantity > 0 ? quantity : '-'}
                                                     </span>
+                                                    {isWinner && (
+                                                      <span className="absolute -right-0.5 -top-0.5 z-20 rounded-full bg-yellow-300 px-1 py-0.5 text-[7px] font-black leading-none text-black shadow-md ring-1 ring-black/60">
+                                                        {winningPositionLabels[winIndex]}
+                                                      </span>
+                                                    )}
                                                   </button>
                                                 );
                                               })}
@@ -10106,18 +10104,43 @@ function App() {
                                                 <div key={group.title}>
                                                   <h5 className="mb-1.5 text-[9px] font-black uppercase tracking-widest text-muted-foreground">{group.title}</h5>
                                                   <div className="grid grid-cols-[repeat(auto-fill,minmax(132px,1fr))] gap-2">
-                                                    {group.rows.map(([key, total]) => (
+                                                    {group.rows.map(([key, total]) => {
+                                                      const isActualWinner = Boolean(lotteryResult) && evaluateBetPrizes(
+                                                        { type: key.startsWith('PL ') ? 'PL' : 'BL', number: key.slice(3), amount: 1 },
+                                                        lotteryResult!,
+                                                        globalSettings
+                                                      ).length > 0;
+                                                      const pale13Simulation = canViewPaleSimulation && key.startsWith('PL ') && lotteryResult
+                                                        ? getPale13Simulation(
+                                                            { type: 'PL', number: key.slice(3), amount: total },
+                                                            lotteryResult,
+                                                            globalSettings,
+                                                            paleSimulationSettings
+                                                          )
+                                                        : null;
+                                                      const isWinningPale = isActualWinner || pale13Simulation !== null;
+                                                      return (
                                                       <button
                                                         type="button"
                                                         key={key}
                                                         onClick={() => openNumberTickets(reportTickets, lotteryName, key.startsWith('PL ') ? 'PL' : 'BL', key.slice(3))}
-                                                        className="flex h-9 min-w-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg border border-primary/20 bg-primary/5 px-2 transition-transform active:scale-95"
+                                                        className={`relative flex h-9 min-w-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg px-2 transition-transform active:scale-95 ${
+                                                          isWinningPale
+                                                            ? 'border-2 border-white bg-emerald-600/95 ring-2 ring-yellow-300/80 shadow-[0_0_10px_rgba(74,222,128,0.55)]'
+                                                            : 'border border-primary/20 bg-primary/5'
+                                                        }`}
                                                       >
                                                         <span className="text-[11px] font-bold text-white">{key}</span>
-                                                        <span className="text-[11px] font-semibold text-muted-foreground">-</span>
-                                                        <span className="text-[11px] font-black text-primary">${total.toFixed(2)}</span>
+                                                        <span className={`text-[11px] font-semibold ${isWinningPale ? 'text-white/80' : 'text-muted-foreground'}`}>-</span>
+                                                        <span className={`text-[11px] font-black ${isWinningPale ? 'text-white' : 'text-primary'}`}>${total.toFixed(2)}</span>
+                                                        {isWinningPale && (
+                                                          <span className="absolute -right-1 -top-1 rounded-full bg-yellow-300 px-1.5 py-0.5 text-[7px] font-black uppercase leading-none text-black shadow-md ring-1 ring-black/60">
+                                                            Win
+                                                          </span>
+                                                        )}
                                                       </button>
-                                                    ))}
+                                                      );
+                                                    })}
                                                   </div>
                                                 </div>
                                               ))}
@@ -11605,6 +11628,80 @@ function App() {
                         </button>
                       </form>
                     </div>
+                    {configSection === 'perfil' && canViewPaleSimulation && (
+                      <div className="glass-card p-6 border-amber-400/20 bg-amber-400/[0.03] space-y-5">
+                        <div className="flex items-center gap-3 border-b border-white/5 pb-4">
+                          <div className="rounded-lg bg-amber-400/15 p-2 text-amber-300">
+                            <Trophy className="h-5 w-5" />
+                          </div>
+                          <div>
+                            <h3 className="font-black uppercase tracking-widest text-sm">Coincidencias informativas de Palé</h3>
+                            <p className="mt-1 text-[10px] font-bold uppercase tracking-wider text-amber-100/60">Solo CEO principal y programador</p>
+                          </div>
+                        </div>
+
+                        <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-black/20 p-4">
+                          <input
+                            type="checkbox"
+                            checked={paleSimulationSettings.enabled}
+                            onChange={event => setPaleSimulationSettings(current => ({ ...current, enabled: event.target.checked }))}
+                            className="mt-0.5 h-4 w-4 accent-amber-400"
+                          />
+                          <span>
+                            <span className="block text-xs font-black uppercase tracking-wider text-white">Mostrar coincidencias 1.º + 3.º</span>
+                            <span className="mt-1 block text-[11px] leading-relaxed text-white/60">Se muestran aparte cuando el multiplicador real de esa combinación está en 0.</span>
+                          </span>
+                        </label>
+
+                        <div className="space-y-2">
+                          <label htmlFor="pale-simulation-multiplier" className="text-xs font-black uppercase tracking-widest text-white/70">
+                            Multiplicador informativo
+                          </label>
+                          <input
+                            id="pale-simulation-multiplier"
+                            type="number"
+                            min="0.01"
+                            step="0.01"
+                            value={paleSimulationMultiplierInput}
+                            onChange={event => setPaleSimulationMultiplierInput(event.target.value)}
+                            placeholder="Sin configurar"
+                            className="w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 text-sm font-bold text-white focus:border-amber-400 focus:outline-none"
+                          />
+                          <p className="text-[11px] leading-relaxed text-white/60">
+                            Se calcula como el monto apostado × este multiplicador. Si queda vacío, se marca la coincidencia sin monto. No cambia premios reales ni liquidaciones; vendedores y clientes no ven este dato, tampoco en la imagen compartida.
+                          </p>
+                        </div>
+
+                        <button
+                          type="button"
+                          disabled={isSavingPaleSimulation}
+                          onClick={async () => {
+                            const rawMultiplier = paleSimulationMultiplierInput.trim();
+                            const multiplier = rawMultiplier ? Number(rawMultiplier) : null;
+                            if (rawMultiplier && (!Number.isFinite(multiplier) || (multiplier ?? 0) <= 0)) {
+                              toast.error('El multiplicador informativo debe ser mayor que 0');
+                              return;
+                            }
+                            setIsSavingPaleSimulation(true);
+                            try {
+                              await setDoc(doc(db, 'settings', 'paleSimulation'), {
+                                enabled: paleSimulationSettings.enabled,
+                                multiplier,
+                                updatedAt: serverTimestamp()
+                              });
+                              toast.success('Ajuste informativo guardado');
+                            } catch (error) {
+                              handleFirestoreError(error, OperationType.WRITE, 'settings/paleSimulation');
+                            } finally {
+                              setIsSavingPaleSimulation(false);
+                            }
+                          }}
+                          className="w-full rounded-xl bg-amber-400 py-3 text-xs font-black uppercase tracking-widest text-black transition-colors hover:bg-amber-300 disabled:opacity-50"
+                        >
+                          {isSavingPaleSimulation ? 'Guardando...' : 'Guardar ajuste informativo'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
                 )}
